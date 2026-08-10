@@ -90,6 +90,18 @@ async function requireLocalFile(filePath) {
   return absolute;
 }
 
+export function normalizeWebMcpExecution(toolName, value) {
+  if (value && typeof value === "object" && !Array.isArray(value)
+      && typeof value.status === "string" && Object.hasOwn(value, "output")) {
+    if (value.status === "Completed") return value.output;
+    const detail = typeof value.output === "string"
+      ? value.output
+      : value.error?.message ?? value.message ?? "WebMCP execution did not complete";
+    throw new Error(`${toolName} WebMCP execution ${value.status}: ${detail}`);
+  }
+  return value;
+}
+
 export class ChromeSession {
   constructor({ isolationId, config }) {
     assertIsolationId(isolationId);
@@ -205,7 +217,7 @@ export class ChromeSession {
       [toolName, input],
       { returnByValue: true, timeoutMs }
     );
-    return remote.value ?? null;
+    return normalizeWebMcpExecution(toolName, remote.value ?? null);
   }
 
   async snapshotElements() {
