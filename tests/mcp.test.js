@@ -47,6 +47,37 @@ test("stdio MCP tool results expose compact text plus one structured object with
   assert.equal(reply.result.isError, false);
 });
 
+test("start_analyze forwards a caller-supplied state_path for repeated starts on the same lane", async () => {
+  const starts = [];
+  const manager = {
+    async startAnalyze(isolationId, statePath) {
+      starts.push({ isolationId, statePath });
+      return { ok: true, isolationId, statePath };
+    },
+    async closeAll() {}
+  };
+  const server = new McpHarnessServer({
+    configPath: "harness.toml",
+    managerFactory: () => manager
+  });
+  for (const [id, statePath] of [[11, "C:\\states\\a.dst"], [12, "C:\\states\\b.dst"]]) {
+    const reply = await server.handle({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        name: "start_analyze",
+        arguments: { isolation_id: "lane-a", state_path: statePath }
+      }
+    });
+    assert.equal(reply.result.structuredContent.statePath, statePath);
+  }
+  assert.deepEqual(starts, [
+    { isolationId: "lane-a", statePath: "C:\\states\\a.dst" },
+    { isolationId: "lane-a", statePath: "C:\\states\\b.dst" }
+  ]);
+});
+
 test("stdio MCP initialize returns server instructions and negotiates the requested supported protocol", async () => {
   const server = new McpHarnessServer({
     configPath: "harness.toml",

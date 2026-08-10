@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DesmumeHarness } from "../src/desmume-harness.js";
@@ -15,7 +15,7 @@ function config(overrides = {}) {
     commandTimeoutMs: 1000,
     profileRoot: ".harness/profiles",
     romPath: "C:\\roms\\game.nds",
-    statePath: "C:\\states\\baseline.dst",
+    screenshotPath: "C:\\shots\\frame.png",
     baselineName: "analysis-start",
     replaceBaseline: true,
     ...overrides
@@ -35,8 +35,8 @@ class FakeAnalyzeSession {
     this.events.push(`snapshot:${phase}`);
     return [{ phase }];
   }
-  async uploadFileByLabel(label) {
-    this.events.push(`upload:${label}`);
+  async uploadFileByLabel(label, filePath) {
+    this.events.push(`upload:${label}:${filePath}`);
     if (label === "ROM") {
       this.romLoaded = true;
       this.fileTransactionSerial += 1;
@@ -65,15 +65,58 @@ test("startAnalyze snapshots around ROM load, waits for State serial, then saves
     config: config(),
     sessionFactory: () => fake
   });
-  const result = await harness.startAnalyze();
+  const statePath = "C:\\states\\external.dst";
+  const result = await harness.startAnalyze(statePath);
   assert.equal(result.baseline.name, "analysis-start");
   assert.deepEqual(result.snapshots.beforeRom, [{ phase: "before-rom" }]);
   assert.deepEqual(result.snapshots.afterRom, [{ phase: "after-rom" }]);
-  assert.deepEqual(fake.events.filter((event) => event.startsWith("upload:")), ["upload:ROM", "upload:State In"]);
-  const stateUpload = fake.events.indexOf("upload:State In");
+  assert.deepEqual(fake.events.filter((event) => event.startsWith("upload:")), [
+    "upload:ROM:C:\\roms\\game.nds",
+    `upload:State In:${statePath}`
+  ]);
+  const stateUpload = fake.events.indexOf(`upload:State In:${statePath}`);
   const baselineSave = fake.events.indexOf("mcp:saveAnalysisBaseline");
   assert.ok(stateUpload >= 0 && baselineSave > stateUpload);
   assert.equal(fake.events.includes("mcp:stepFrames"), false);
+});
+
+test("screenshot writes the DeSmuME PNG framebuffer to the configured path without returning dataUrl", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "desmume-harness-shot-"));
+  const screenshotPath = path.join(directory, "nested", "frame.png");
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const session = {
+    async start() {},
+    async callDirect(command, params) {
+      assert.equal(command, "takeScreenshot");
+      assert.deepEqual(params, {
+        download: false,
+        includeDataUrl: true,
+        cooldownMs: 250,
+        name: "frame.png"
+      });
+      return {
+        ok: true,
+        type: "image/png",
+        name: "frame.png",
+        width: 256,
+        height: 384,
+        cooldownMs: 250,
+        dataUrl: `data:image/png;base64,${pngBytes.toString("base64")}`
+      };
+    },
+    async close() {}
+  };
+  const harness = new DesmumeHarness({
+    isolationId: "lane-shot",
+    config: config({ screenshotPath }),
+    sessionFactory: () => session
+  });
+  const result = await harness.screenshot();
+  assert.deepEqual(await readFile(screenshotPath), pngBytes);
+  assert.equal(result.path, screenshotPath);
+  assert.equal(result.width, 256);
+  assert.equal(result.height, 384);
+  assert.equal(result.dataUrl, undefined);
 });
 
 class FakeScriptSession {

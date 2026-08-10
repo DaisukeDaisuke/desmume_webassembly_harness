@@ -17,8 +17,8 @@ export class HarnessManager {
     return harness;
   }
 
-  async startAnalyze(isolationId = "default") {
-    return await (await this.create(isolationId)).startAnalyze();
+  async startAnalyze(isolationId = "default", statePath) {
+    return await (await this.create(isolationId)).startAnalyze(statePath);
   }
 
   async close(isolationId) {

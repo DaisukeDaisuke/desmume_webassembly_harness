@@ -4,13 +4,13 @@
 - Node.js 22+
 - Google Chrome
 - Codex CLI / Codex IDE extension / ChatGPT desktop app のローカル MCP 対応環境
-- `harness.toml` に指定する ROM と State
+- `harness.toml` に指定する ROM とスクリーンショット保存先、`start_analyze` 呼び出し時に指定する State
 追加 npm パッケージは使用しません。
 ## 設定
-`harness.example.toml` を `harness.toml` にコピーし、ROM と State のローカルパスを設定します。Windows パスは TOML literal string としてシングルクォートで囲めます。
+`harness.example.toml` を `harness.toml` にコピーし、ROM とスクリーンショット保存先を設定します。State は設定ファイルには置かず、`start_analyze` の呼び出しごとに外部指定します。Windows パスは TOML literal string としてシングルクォートで囲めます。
 ```toml
 rom_path = 'C:\dq9\rom.nds'
-state_path = 'C:\dq9\baseline.dst'
+screenshot_path = 'C:\dq9\screenshots\frame.png'
 baseline_name = 'battle-start'
 ```
 `harness.toml` と Chrome の分離プロファイル `.harness/` は Git 対象外です。
@@ -38,7 +38,7 @@ tool_timeout_sec = 600
 tool_output_token_limit = 1000000
 ```
 ## Codexから見えるMCP tools
-- `start_analyze`: Chrome起動、初回snapshot、ROM読込、再snapshot、State読込、analysis baseline作成まで行う。
+- `start_analyze`: `state_path` を引数で受け、Chrome起動または既存lane再利用、初回snapshot、ROM読込、再snapshot、State読込、analysis baseline作成まで行う。
 - `status`: 現在のDeSmuME状態を取得する。
 - `pause`: エミュレータを停止する。
 - `resume`: エミュレータを再開する。
@@ -49,39 +49,50 @@ tool_output_token_limit = 1000000
 - `stop_pscript`: Persistent Scriptを停止する。
 - `restart_pscript`: Persistent Scriptを再起動する。
 - `snapshot_elements`: 現在の操作要素と位置を取得する。
+- `screenshot`: DeSmuMEの256x384フレームバッファだけをPNG化し、`screenshot_path` へ保存する。ブラウザウインドウ全体は撮らない。
 - `save_baseline`: analysis baselineを保存する。
 - `restore_baseline`: analysis baselineを復元する。
 - `list_pscript_mcp`: Persistent Scriptが公開したMCP一覧を取得する。
 - `call_pscript_mcp`: Persistent Script MCPを呼ぶ。
 - `close_instance`: isolation idに対応するChrome/DeSmuMEを閉じる。
 ## start_analyze
-新しい `isolation_id` では原則として最初に `start_analyze` を呼びます。処理順は以下です。
+新しい `isolation_id` では原則として最初に `start_analyze` を呼びます。`state_path` は必須引数です。同じ `isolation_id` で別の `state_path` を指定して再度呼んでも、stdio MCPやChromeプロセス自体は再起動せず既存laneを再利用します。処理順は以下です。
+```text
+start_analyze { isolation_id: "lane-a", state_path: "C:\\dq9\\states\\battle-a.dst" }
+```
 1. isolation id 専用Chrome profileと自動割当DevTools portでChromeを起動する。
 2. Chromeを `--enable-features=WebMCPTesting,DevToolsWebMCPSupport` 付きで起動し、DeSmuMEのWebMCP登録完了を待つ。
 3. 現在の操作要素と位置をsnapshotする。
 4. `harness.toml` のROMをfile inputへローカル投入し、file transaction完了まで待つ。
 5. ROM読込後の操作要素を再snapshotする。
-6. `harness.toml` のStateをfile inputへローカル投入し、`stateLoadSerial` 増加とfile transaction完了まで待つ。
+6. 呼び出し引数 `state_path` のStateをfile inputへローカル投入し、`stateLoadSerial` 増加とfile transaction完了まで待つ。
 7. State読込直後の状態を `saveAnalysisBaseline` で保存する。baseline作成のために余計なframeは進めない。
 8. `snapshotContext` を取得して返す。
 ## 複数エミュレータ
 すべての主要toolは `isolation_id` を受け取ります。異なる `isolation_id` は別Chrome profileと別DevTools portを使用するため、同じstdio MCPプロセスから複数DeSmuMEを同時に保持できます。
 ```text
-start_analyze { isolation_id: "lane-a" }
-start_analyze { isolation_id: "lane-b" }
+start_analyze { isolation_id: "lane-a", state_path: "C:\\dq9\\states\\a.dst" }
+start_analyze { isolation_id: "lane-b", state_path: "C:\\dq9\\states\\b.dst" }
 ```
-`harness.toml` の `[instances.<id>]` でROM、State、baseline名をlane単位に上書きできます。
+`harness.toml` の `[instances.<id>]` でROM、スクリーンショット保存先、baseline名をlane単位に上書きできます。Stateは常に `start_analyze` 引数です。
 ```toml
 [instances.lane-a]
 baseline_name = 'battle-a'
+screenshot_path = 'C:\dq9\screenshots\lane-a.png'
 [instances.lane-b]
 baseline_name = 'battle-b'
+screenshot_path = 'C:\dq9\screenshots\lane-b.png'
 ```
+## フレームスクリーンショット
+`screenshot` はブラウザやChromeウインドウのキャプチャではなく、DeSmuME本体の `takeScreenshot` が `ui.screen.toDataURL()` で生成する256x384のDSキャンバスPNGだけを保存します。保存先は `screenshot_path` です。PNG本体のdata URLはMCP出力へ返しません。
+
+State読込直後はAPI_CURRENTの仕様上、1つのcomplete emulator frameが進むまで画面capture APIが `SCREEN_INVALID` になります。`start_analyze` は読み込んだStateを厳密に保つため勝手に1フレーム進めません。そのため必要なタイミングでフレームを進めた後に `screenshot` を呼びます。
 ## WebMCP transport
 Chrome内部ではDeSmuMEページが登録したWebMCPを使用しますが、生の `desmume.call`、`desmume.eval`、`desmume.runScript` tool objectをCodex側へ再公開しません。stdio MCP側では用途別のtoolとして隠蔽します。
 - `call` / `pause` / `resume` / `status` は内部で `desmume.call` を使う。
 - `eval` は内部で `desmume.eval` を使う。
 - `rerun_script` は内部で `desmume.runScript` を使う。
+- `screenshot` はPNG bytesを保存する必要があるため、内部のdocumented `takeScreenshot({download:false,includeDataUrl:true})` を直接使い、data URLはstdio MCPへ漏らさない。
 - Persistent Script管理、file transaction serial監視、baseline管理など、structured resultを機械判定する内部処理はDeSmuMEのdocumented browser APIを直接使う。
 WebMCP実行系が返す `status: "Completed"` のようなtransport wrapperはstdio MCPの外へ出しません。実際のDeSmuME出力だけを返します。
 ## MCP output

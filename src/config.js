@@ -11,7 +11,7 @@ const DEFAULTS = Object.freeze({
   command_timeout_ms: 600000,
   profile_root: ".harness/profiles",
   rom_path: "",
-  state_path: "",
+  screenshot_path: ".harness/screenshots/frame.png",
   baseline_name: "analysis-start",
   replace_baseline: true
 });
@@ -160,10 +160,14 @@ export function resolveHarnessConfig(raw, configPath, isolationId = "default") {
   if (instance === null || typeof instance !== "object" || Array.isArray(instance)) {
     throw new Error(`instances.${isolationId} must be a TOML table`);
   }
+  if (Object.hasOwn(raw, "state_path") || Object.hasOwn(instance, "state_path")) {
+    throw new Error("state_path is not a harness.toml setting; pass state_path to start_analyze");
+  }
   const merged = { ...DEFAULTS, ...raw, ...instance };
   delete merged.instances;
   if (typeof merged.url !== "string" || !merged.url) throw new Error("url must be a non-empty string");
   if (typeof merged.headless !== "boolean") throw new Error("headless must be boolean");
+  if (typeof merged.screenshot_path !== "string" || !merged.screenshot_path) throw new Error("screenshot_path must be a non-empty string");
   if (typeof merged.baseline_name !== "string" || !merged.baseline_name) throw new Error("baseline_name must be a non-empty string");
   if (typeof merged.replace_baseline !== "boolean") throw new Error("replace_baseline must be boolean");
   return Object.freeze({
@@ -175,7 +179,7 @@ export function resolveHarnessConfig(raw, configPath, isolationId = "default") {
     commandTimeoutMs: requirePositiveInteger(merged.command_timeout_ms, "command_timeout_ms"),
     profileRoot: absoluteFrom(baseDir, merged.profile_root),
     romPath: absoluteFrom(baseDir, merged.rom_path),
-    statePath: absoluteFrom(baseDir, merged.state_path),
+    screenshotPath: absoluteFrom(baseDir, merged.screenshot_path),
     baselineName: merged.baseline_name,
     replaceBaseline: merged.replace_baseline
   });

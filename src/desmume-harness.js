@@ -1,4 +1,5 @@
 import path from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { ChromeSession } from "./chrome-session.js";
 import { readUtf8Text } from "./config.js";
@@ -87,9 +88,9 @@ export class DesmumeHarness {
     );
   }
 
-  async loadState(filePath = this.config.statePath) {
+  async loadState(filePath) {
     await this.start();
-    if (!filePath) throw new Error("state_path is not configured");
+    if (typeof filePath !== "string" || !filePath.trim()) throw new Error("state_path is required");
     const before = requireOk(await this.#directCall("status"), "status before State load");
     const previousSerial = Number(before.stateLoadSerial ?? 0);
     await this.session.uploadFileByLabel("State In", filePath);
@@ -107,12 +108,12 @@ export class DesmumeHarness {
     return requireOk(await this.#directCall("restoreAnalysisBaseline", { name }), "restoreAnalysisBaseline");
   }
 
-  async startAnalyze() {
+  async startAnalyze(statePath) {
     await this.start();
     const beforeRom = await this.snapshotElements();
     const romStatus = await this.loadRom();
     const afterRom = await this.snapshotElements();
-    const stateStatus = await this.loadState();
+    const stateStatus = await this.loadState(statePath);
     const baseline = await this.saveBaseline();
     const context = requireOk(await this.#directCall("snapshotContext"), "snapshotContext");
     return {
@@ -128,6 +129,26 @@ export class DesmumeHarness {
         afterRom
       }
     };
+  }
+
+  async screenshot() {
+    const outputPath = this.config.screenshotPath;
+    if (!outputPath) throw new Error("screenshot_path is not configured");
+    const capture = requireOk(await this.#directCall("takeScreenshot", {
+      download: false,
+      includeDataUrl: true,
+      cooldownMs: 250,
+      name: path.basename(outputPath)
+    }), "takeScreenshot");
+    const prefix = "data:image/png;base64,";
+    if (typeof capture.dataUrl !== "string" || !capture.dataUrl.startsWith(prefix)) {
+      throw new Error("takeScreenshot did not return a PNG data URL");
+    }
+    const bytes = Buffer.from(capture.dataUrl.slice(prefix.length), "base64");
+    await mkdir(path.dirname(outputPath), { recursive: true });
+    await writeFile(outputPath, bytes);
+    const { dataUrl: _dataUrl, ...metadata } = capture;
+    return { ...metadata, path: outputPath, bytes: bytes.length };
   }
 
   async eval(script, timeoutMs = this.config.commandTimeoutMs) {

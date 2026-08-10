@@ -5,7 +5,7 @@ import { HarnessManager } from "./manager.js";
 import { compactOutputText } from "./compact-output.js";
 
 const SERVER_NAME = "desmume-webassembly-harness";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.3.0";
 const SUPPORTED_PROTOCOLS = new Set([
   "2025-11-25",
   "2025-06-18",
@@ -39,8 +39,11 @@ const timeoutProperty = {
 const TOOLS = Object.freeze([
   {
     name: "start_analyze",
-    description: "Start an isolated Chrome/DeSmuME instance, snapshot controls, load the configured ROM and State, snapshot again after ROM load, and create the configured analysis baseline.",
-    inputSchema: objectSchema({ isolation_id: isolationProperty })
+    description: "Start or reuse an isolated Chrome/DeSmuME instance, snapshot controls, load the configured ROM and caller-supplied State, snapshot again after ROM load, and create the configured analysis baseline.",
+    inputSchema: objectSchema({
+      isolation_id: isolationProperty,
+      state_path: { type: "string", minLength: 1, description: "Local State file to load for this analysis start." }
+    }, ["state_path"])
   },
   {
     name: "status",
@@ -124,6 +127,11 @@ const TOOLS = Object.freeze([
     description: "Snapshot the current interactive page controls and their positions for one emulator instance.",
     inputSchema: objectSchema({ isolation_id: isolationProperty }),
     annotations: { readOnlyHint: true }
+  },
+  {
+    name: "screenshot",
+    description: "Save the DeSmuME 256x384 framebuffer canvas as PNG to screenshot_path from harness.toml. This does not capture the browser window.",
+    inputSchema: objectSchema({ isolation_id: isolationProperty })
   },
   {
     name: "save_baseline",
@@ -282,7 +290,8 @@ export class McpHarnessServer {
     const args = requireObject(rawArguments, "tool arguments");
     switch (name) {
       case "start_analyze":
-        return await this.manager.startAnalyze(optionalIsolation(args));
+        if (typeof args.state_path !== "string" || !args.state_path.trim()) throw new Error("state_path is required");
+        return await this.manager.startAnalyze(optionalIsolation(args), args.state_path);
       case "status":
         return await (await this.#harness(args)).status();
       case "pause":
@@ -331,6 +340,8 @@ export class McpHarnessServer {
         });
       case "snapshot_elements":
         return await (await this.#harness(args)).snapshotElements();
+      case "screenshot":
+        return await (await this.#harness(args)).screenshot();
       case "save_baseline": {
         const harness = await this.#harness(args);
         return await harness.saveBaseline(args.name ?? harness.config.baselineName, args.replace ?? harness.config.replaceBaseline);
@@ -379,7 +390,7 @@ export class McpHarnessServer {
           title: "DeSmuME WebAssembly Harness",
           version: SERVER_VERSION
         },
-        instructions: "Use start_analyze before analysis commands for a new isolation_id. Use a distinct isolation_id for each simultaneous emulator. eval and rerun_script are transported through the page WebMCP tools; persistent-script lifecycle operations call the documented DeSmuME API directly and never click Run/Update in the UI."
+        instructions: "Pass state_path to every start_analyze call. Reusing an isolation_id reuses its Chrome instance. Use a distinct isolation_id for each simultaneous emulator. screenshot saves only the DeSmuME framebuffer to screenshot_path from harness.toml. eval and rerun_script are transported through the page WebMCP tools; persistent-script lifecycle operations call the documented DeSmuME API directly and never click Run/Update in the UI."
       });
     }
     if (message.method === "ping") return response(id, {});

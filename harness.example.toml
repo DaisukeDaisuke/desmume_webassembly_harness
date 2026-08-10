@@ -6,7 +6,7 @@ file_timeout_ms = 60000
 command_timeout_ms = 600000
 profile_root = '.harness/profiles'
 rom_path = 'C:\path\to\game.nds'
-state_path = 'C:\path\to\baseline.dst'
+screenshot_path = '.harness/screenshots/frame.png'
 baseline_name = 'analysis-start'
 replace_baseline = true
 [instances.lane-a]
