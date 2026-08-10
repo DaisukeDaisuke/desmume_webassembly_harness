@@ -1,0 +1,15 @@
+url = 'https://daisukedaisuke.github.io/desmume_webassembly/'
+chrome_path = ''
+headless = false
+startup_timeout_ms = 30000
+file_timeout_ms = 60000
+command_timeout_ms = 600000
+profile_root = '.harness/profiles'
+rom_path = 'C:\path\to\game.nds'
+state_path = 'C:\path\to\baseline.dst'
+baseline_name = 'analysis-start'
+replace_baseline = true
+[instances.lane-a]
+baseline_name = 'analysis-lane-a'
+[instances.lane-b]
+baseline_name = 'analysis-lane-b'

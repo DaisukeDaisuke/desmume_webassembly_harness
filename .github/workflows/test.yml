@@ -1,0 +1,21 @@
+name: test
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  node-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax check
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in src/*.js tests/*.js; do
+            node --check "$file"
+          done
+      - name: Test
+        run: node --test tests/*.test.js
