@@ -5,7 +5,7 @@ import { HarnessManager } from "./manager.js";
 import { compactOutputText } from "./compact-output.js";
 
 const SERVER_NAME = "desmume-webassembly-harness";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.3.1";
 const SUPPORTED_PROTOCOLS = new Set([
   "2025-11-25",
   "2025-06-18",
@@ -130,8 +130,11 @@ const TOOLS = Object.freeze([
   },
   {
     name: "screenshot",
-    description: "Save the DeSmuME 256x384 framebuffer canvas as PNG to screenshot_path from harness.toml. This does not capture the browser window.",
-    inputSchema: objectSchema({ isolation_id: isolationProperty })
+    description: "Save the DeSmuME 256x384 framebuffer canvas as a new PNG under screenshot_path from harness.toml. This does not capture the browser window.",
+    inputSchema: objectSchema({
+      isolation_id: isolationProperty,
+      name: { type: "string", minLength: 1, description: "Optional PNG file name. Omit it for an automatically numbered frame-NNNNNN.png name." }
+    })
   },
   {
     name: "save_baseline",
@@ -341,7 +344,7 @@ export class McpHarnessServer {
       case "snapshot_elements":
         return await (await this.#harness(args)).snapshotElements();
       case "screenshot":
-        return await (await this.#harness(args)).screenshot();
+        return await (await this.#harness(args)).screenshot(args.name);
       case "save_baseline": {
         const harness = await this.#harness(args);
         return await harness.saveBaseline(args.name ?? harness.config.baselineName, args.replace ?? harness.config.replaceBaseline);

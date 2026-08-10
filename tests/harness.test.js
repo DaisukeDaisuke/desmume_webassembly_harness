@@ -15,7 +15,7 @@ function config(overrides = {}) {
     commandTimeoutMs: 1000,
     profileRoot: ".harness/profiles",
     romPath: "C:\\roms\\game.nds",
-    screenshotPath: "C:\\shots\\frame.png",
+    screenshotPath: "C:\\shots",
     baselineName: "analysis-start",
     replaceBaseline: true,
     ...overrides
@@ -80,24 +80,23 @@ test("startAnalyze snapshots around ROM load, waits for State serial, then saves
   assert.equal(fake.events.includes("mcp:stepFrames"), false);
 });
 
-test("screenshot writes the DeSmuME PNG framebuffer to the configured path without returning dataUrl", async () => {
+test("screenshot writes multiple DeSmuME PNG framebuffers under the configured directory without returning dataUrl", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "desmume-harness-shot-"));
-  const screenshotPath = path.join(directory, "nested", "frame.png");
+  const screenshotPath = path.join(directory, "nested");
   const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const names = [];
   const session = {
     async start() {},
     async callDirect(command, params) {
       assert.equal(command, "takeScreenshot");
-      assert.deepEqual(params, {
-        download: false,
-        includeDataUrl: true,
-        cooldownMs: 250,
-        name: "frame.png"
-      });
+      names.push(params.name);
+      assert.equal(params.download, false);
+      assert.equal(params.includeDataUrl, true);
+      assert.equal(params.cooldownMs, 250);
       return {
         ok: true,
         type: "image/png",
-        name: "frame.png",
+        name: params.name,
         width: 256,
         height: 384,
         cooldownMs: 250,
@@ -111,12 +110,24 @@ test("screenshot writes the DeSmuME PNG framebuffer to the configured path witho
     config: config({ screenshotPath }),
     sessionFactory: () => session
   });
-  const result = await harness.screenshot();
-  assert.deepEqual(await readFile(screenshotPath), pngBytes);
-  assert.equal(result.path, screenshotPath);
-  assert.equal(result.width, 256);
-  assert.equal(result.height, 384);
-  assert.equal(result.dataUrl, undefined);
+  const first = await harness.screenshot();
+  const second = await harness.screenshot("battle-start");
+  assert.deepEqual(names, ["frame-000001.png", "battle-start.png"]);
+  assert.deepEqual(await readFile(path.join(screenshotPath, "frame-000001.png")), pngBytes);
+  assert.deepEqual(await readFile(path.join(screenshotPath, "battle-start.png")), pngBytes);
+  assert.equal(first.path, path.join(screenshotPath, "frame-000001.png"));
+  assert.equal(second.path, path.join(screenshotPath, "battle-start.png"));
+  assert.equal(first.dataUrl, undefined);
+  assert.equal(second.dataUrl, undefined);
+});
+
+test("screenshot rejects a name that escapes the configured screenshot directory", async () => {
+  const harness = new DesmumeHarness({
+    isolationId: "lane-shot",
+    config: config(),
+    sessionFactory: () => ({ async start() {}, async close() {} })
+  });
+  await assert.rejects(() => harness.screenshot("..\\outside.png"), /must be a file name/u);
 });
 
 class FakeScriptSession {

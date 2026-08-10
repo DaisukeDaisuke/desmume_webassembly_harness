@@ -11,7 +11,7 @@ const DEFAULTS = Object.freeze({
   command_timeout_ms: 600000,
   profile_root: ".harness/profiles",
   rom_path: "",
-  screenshot_path: ".harness/screenshots/frame.png",
+  screenshot_path: ".harness/screenshots",
   baseline_name: "analysis-start",
   replace_baseline: true
 });

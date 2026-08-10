@@ -28,6 +28,7 @@ export class DesmumeHarness {
     this.isolationId = isolationId;
     this.config = config;
     this.session = sessionFactory({ isolationId, config });
+    this.screenshotSerial = 0;
   }
 
   async start() {
@@ -131,21 +132,34 @@ export class DesmumeHarness {
     };
   }
 
-  async screenshot() {
-    const outputPath = this.config.screenshotPath;
-    if (!outputPath) throw new Error("screenshot_path is not configured");
+  async screenshot(name) {
+    const outputDirectory = this.config.screenshotPath;
+    if (!outputDirectory) throw new Error("screenshot_path is not configured");
+    let fileName;
+    if (name === undefined) {
+      this.screenshotSerial += 1;
+      fileName = `frame-${String(this.screenshotSerial).padStart(6, "0")}.png`;
+    } else {
+      if (typeof name !== "string" || !name.trim()) throw new Error("screenshot name must be a non-empty string");
+      fileName = name.trim();
+      if (fileName.includes("/") || fileName.includes("\\") || fileName === "." || fileName === "..") {
+        throw new Error("screenshot name must be a file name, not a path");
+      }
+      if (!fileName.toLowerCase().endsWith(".png")) fileName += ".png";
+    }
+    const outputPath = path.join(outputDirectory, fileName);
     const capture = requireOk(await this.#directCall("takeScreenshot", {
       download: false,
       includeDataUrl: true,
       cooldownMs: 250,
-      name: path.basename(outputPath)
+      name: fileName
     }), "takeScreenshot");
     const prefix = "data:image/png;base64,";
     if (typeof capture.dataUrl !== "string" || !capture.dataUrl.startsWith(prefix)) {
       throw new Error("takeScreenshot did not return a PNG data URL");
     }
     const bytes = Buffer.from(capture.dataUrl.slice(prefix.length), "base64");
-    await mkdir(path.dirname(outputPath), { recursive: true });
+    await mkdir(outputDirectory, { recursive: true });
     await writeFile(outputPath, bytes);
     const { dataUrl: _dataUrl, ...metadata } = capture;
     return { ...metadata, path: outputPath, bytes: bytes.length };
