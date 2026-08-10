@@ -38,7 +38,7 @@ tool_timeout_sec = 600
 tool_output_token_limit = 1000000
 ```
 ## Codexから見えるMCP tools
-- `start_analyze`: `state_path` を引数で受け、Chrome起動または既存lane再利用、初回snapshot、ROM読込、再snapshot、State読込、analysis baseline作成まで行う。
+- `start_analyze`: `state_path` を引数で受け、Chrome起動または既存lane再利用、ROM読込、State読込、analysis baseline作成まで行い、`status` / `paused` / `running` だけを返す。
 - `status`: 現在のDeSmuME状態を取得する。
 - `direct_status`: WebMCP transportを挟まずdocumented browser APIから現在のDeSmuME statusを直接取得する。
 - `analysis_context`: チャットを跨いで作業を再開するための小さい状況要約を返す。State/baseline、pause/run、frame、ARM9 PC/CPSR、最新break、起動中Persistent Scriptだけを含み、call stackやdisassemblyは含めない。
@@ -66,12 +66,10 @@ start_analyze { isolation_id: "lane-a", state_path: "C:\\dq9\\states\\battle-a.d
 ```
 1. isolation id 専用Chrome profileと自動割当DevTools portでChromeを起動する。
 2. Chromeを `--enable-features=WebMCPTesting,DevToolsWebMCPSupport` 付きで起動し、DeSmuMEのWebMCP登録完了を待つ。
-3. 現在の操作要素と位置をsnapshotする。
-4. `harness.toml` のROMをfile inputへローカル投入し、file transaction完了まで待つ。
-5. ROM読込後の操作要素を再snapshotする。
-6. 呼び出し引数 `state_path` のStateをfile inputへローカル投入し、`stateLoadSerial` 増加とfile transaction完了まで待つ。
-7. State読込直後の状態を `saveAnalysisBaseline` で保存する。baseline作成のために余計なframeは進めない。
-8. `snapshotContext` を取得して返す。
+3. `harness.toml` のROMをfile inputへローカル投入し、file transaction完了まで待つ。
+4. 呼び出し引数 `state_path` のStateをfile inputへローカル投入し、`stateLoadSerial` 増加とfile transaction完了まで待つ。
+5. State読込直後の状態を `saveAnalysisBaseline` で保存する。baseline作成のために余計なframeは進めない。
+6. `{ status: "ok", paused, running }` だけを返す。UI snapshot、full status、`snapshotContext` は返さず、必要な場合は専用toolを別途呼ぶ。
 
 ## チャットを跨いで作業を再開する
 `analysis_context` は再開に必要な情報だけを小さく返します。通常はbreakpoint一覧も省略し、必要な場合だけ `include_breakpoints: true` を指定します。call stack、disassembly、script source、console全文は自動では含めません。

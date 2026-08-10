@@ -125,24 +125,13 @@ export class DesmumeHarness {
 
   async startAnalyze(statePath) {
     await this.start();
-    const beforeRom = await this.snapshotElements();
-    const romStatus = await this.loadRom();
-    const afterRom = await this.snapshotElements();
+    await this.loadRom();
     const stateStatus = await this.loadState(statePath);
-    const baseline = await this.saveBaseline();
-    const context = requireOk(await this.#directCall("snapshotContext"), "snapshotContext");
+    await this.saveBaseline();
     return {
-      isolationId: this.isolationId,
-      baseline,
-      context,
-      status: {
-        afterRom: romStatus,
-        afterState: stateStatus
-      },
-      snapshots: {
-        beforeRom,
-        afterRom
-      }
+      status: "ok",
+      paused: stateStatus.paused,
+      running: stateStatus.running
     };
   }
 

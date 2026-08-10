@@ -48,17 +48,18 @@ class FakeAnalyzeSession {
     if (command === "status") return {
       ok: true,
       romLoaded: this.romLoaded,
+      paused: false,
+      running: true,
       stateLoadSerial: this.stateLoadSerial,
       fileTransaction: { active: false, serial: this.fileTransactionSerial }
     };
     if (command === "saveAnalysisBaseline") return { ok: true, name: params.name, replace: params.replace };
-    if (command === "snapshotContext") return { ok: true, pc: "02000000" };
     throw new Error(`unexpected command ${command}`);
   }
   async close() {}
 }
 
-test("startAnalyze snapshots around ROM load, waits for State serial, then saves the exact loaded State", async () => {
+test("startAnalyze loads ROM and State, saves the baseline, and returns only compact run state", async () => {
   const fake = new FakeAnalyzeSession();
   const harness = new DesmumeHarness({
     isolationId: "lane-a",
@@ -67,9 +68,7 @@ test("startAnalyze snapshots around ROM load, waits for State serial, then saves
   });
   const statePath = "C:\\states\\external.dst";
   const result = await harness.startAnalyze(statePath);
-  assert.equal(result.baseline.name, "analysis-start");
-  assert.deepEqual(result.snapshots.beforeRom, [{ phase: "before-rom" }]);
-  assert.deepEqual(result.snapshots.afterRom, [{ phase: "after-rom" }]);
+  assert.deepEqual(result, { status: "ok", paused: false, running: true });
   assert.deepEqual(fake.events.filter((event) => event.startsWith("upload:")), [
     "upload:ROM:C:\\roms\\game.nds",
     `upload:State In:${statePath}`
@@ -77,6 +76,8 @@ test("startAnalyze snapshots around ROM load, waits for State serial, then saves
   const stateUpload = fake.events.indexOf(`upload:State In:${statePath}`);
   const baselineSave = fake.events.indexOf("mcp:saveAnalysisBaseline");
   assert.ok(stateUpload >= 0 && baselineSave > stateUpload);
+  assert.equal(fake.events.some((event) => event.startsWith("snapshot:")), false);
+  assert.equal(fake.events.includes("mcp:snapshotContext"), false);
   assert.equal(fake.events.includes("mcp:stepFrames"), false);
 });
 

@@ -5,7 +5,7 @@ import { HarnessManager } from "./manager.js";
 import { compactOutputText } from "./compact-output.js";
 
 const SERVER_NAME = "desmume-webassembly-harness";
-const SERVER_VERSION = "0.3.3";
+const SERVER_VERSION = "0.3.4";
 const SUPPORTED_PROTOCOLS = new Set([
   "2025-11-25",
   "2025-06-18",
@@ -39,7 +39,7 @@ const timeoutProperty = {
 const TOOLS = Object.freeze([
   {
     name: "start_analyze",
-    description: "Start or reuse an isolated Chrome/DeSmuME instance, snapshot controls, load the configured ROM and caller-supplied State, snapshot again after ROM load, and create the configured analysis baseline.",
+    description: "Start or reuse an isolated Chrome/DeSmuME instance, load the configured ROM and caller-supplied State, create the configured analysis baseline, and return only status/paused/running.",
     inputSchema: objectSchema({
       isolation_id: isolationProperty,
       state_path: { type: "string", minLength: 1, description: "Local State file to load for this analysis start." }
