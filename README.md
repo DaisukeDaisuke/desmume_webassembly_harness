@@ -35,6 +35,7 @@ args = ["C:\\Users\\owner\\Documents\\desmume_webassembly_harness\\src\\mcpMain.
 cwd = "C:\\Users\\owner\\Documents\\desmume_webassembly_harness"
 startup_timeout_sec = 30
 tool_timeout_sec = 600
+tool_output_token_limit = 1000000
 ```
 ## Codexから見えるMCP tools
 - `start_analyze`: Chrome起動、初回snapshot、ROM読込、再snapshot、State読込、analysis baseline作成まで行う。
