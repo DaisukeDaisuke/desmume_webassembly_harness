@@ -108,6 +108,7 @@ export class ChromeSession {
     const args = [
       `--user-data-dir=${this.profileDir}`,
       "--remote-debugging-port=0",
+      "--enable-features=WebMCPTesting,DevToolsWebMCPSupport",
       "--no-first-run",
       "--no-default-browser-check",
       "about:blank"
@@ -146,6 +147,18 @@ export class ChromeSession {
       this.config.startupTimeoutMs,
       "DeSmuME page API"
     );
+    await this.waitForFunction(
+      async function () {
+        const modelContext = document.modelContext;
+        if (!modelContext || typeof modelContext.getTools !== "function" || typeof modelContext.executeTool !== "function") return false;
+        const tools = await modelContext.getTools();
+        const names = new Set(tools.map((tool) => tool.name));
+        return names.has("desmume.call") && names.has("desmume.eval") && names.has("desmume.runScript");
+      },
+      [],
+      this.config.startupTimeoutMs,
+      "DeSmuME WebMCP tools"
+    );
   }
 
   async #callGlobal(functionDeclaration, args = [], { returnByValue = true, timeoutMs = this.config.commandTimeoutMs } = {}) {
@@ -166,13 +179,33 @@ export class ChromeSession {
     return response.result;
   }
 
-  async callMcp(command, params = {}, timeoutMs = this.config.commandTimeoutMs) {
+  async callDirect(command, params = {}, timeoutMs = this.config.commandTimeoutMs) {
     const remote = await this.#callGlobal(
       "async function(command, params) { return await this.DesmumeMCP.call(command, params); }",
       [command, params],
       { returnByValue: true, timeoutMs }
     );
     return remote.value;
+  }
+
+  async callWebMcp(toolName, input = {}, timeoutMs = this.config.commandTimeoutMs) {
+    const remote = await this.#callGlobal(
+      `async function(toolName, input) {
+        const modelContext = document.modelContext;
+        if (!modelContext || typeof modelContext.getTools !== 'function' || typeof modelContext.executeTool !== 'function') {
+          throw new Error('document.modelContext WebMCP API is unavailable');
+        }
+        const tools = await modelContext.getTools();
+        const matches = tools.filter((tool) => tool.name === toolName);
+        if (matches.length !== 1) {
+          throw new Error('WebMCP tool ' + JSON.stringify(toolName) + ' resolved to ' + matches.length + ' registrations');
+        }
+        return await modelContext.executeTool(matches[0], JSON.stringify(input));
+      }`,
+      [toolName, input],
+      { returnByValue: true, timeoutMs }
+    );
+    return remote.value ?? null;
   }
 
   async snapshotElements() {

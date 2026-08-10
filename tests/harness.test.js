@@ -43,7 +43,7 @@ class FakeAnalyzeSession {
     }
     if (label === "State In") this.stateLoadSerial += 1;
   }
-  async callMcp(command, params) {
+  async callDirect(command, params) {
     this.events.push(`mcp:${command}`);
     if (command === "status") return {
       ok: true,
@@ -91,7 +91,7 @@ class FakeScriptSession {
     assert.equal(source, this.source);
     this.events.push("editor-ready");
   }
-  async callMcp(command, params) {
+  async callDirect(command, params) {
     this.events.push(`mcp:${command}`);
     if (command === "listScripts") return { ok: true, scripts: [{ id: 7, name: "observer", running: true }] };
     if (command === "stopScript") {
@@ -128,5 +128,40 @@ test("rerunPScript stops the same explicit name and directly starts the source l
     "upload:Load source",
     "editor-ready",
     "mcp:runLoadedPersistentScript"
+  ]);
+});
+
+class FakeWebMcpSession {
+  constructor() {
+    this.calls = [];
+  }
+  async start() {}
+  async callWebMcp(toolName, input, timeoutMs) {
+    this.calls.push({ toolName, input, timeoutMs });
+    return `webmcp:${toolName}`;
+  }
+  async close() {}
+}
+
+test("public command helpers use the registered WebMCP tools instead of the direct page command bridge", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "desmume-harness-webmcp-"));
+  const scriptPath = path.join(directory, "oneshot.js");
+  const source = "return await mcp.call('status', {});\n";
+  await writeFile(scriptPath, source, "utf8");
+  const fake = new FakeWebMcpSession();
+  const harness = new DesmumeHarness({
+    isolationId: "lane-webmcp",
+    config: config(),
+    sessionFactory: () => fake
+  });
+  assert.equal(await harness.pause(), "webmcp:desmume.call");
+  assert.equal(await harness.resume(), "webmcp:desmume.call");
+  assert.equal(await harness.eval("return 1;", 4321), "webmcp:desmume.eval");
+  assert.equal(await harness.rerunscript(scriptPath, 8765), "webmcp:desmume.runScript");
+  assert.deepEqual(fake.calls, [
+    { toolName: "desmume.call", input: { command: "pause", params: {} }, timeoutMs: 1000 },
+    { toolName: "desmume.call", input: { command: "resume", params: {} }, timeoutMs: 1000 },
+    { toolName: "desmume.eval", input: { code: "return 1;", timeoutMs: 4321 }, timeoutMs: 5321 },
+    { toolName: "desmume.runScript", input: { code: source, timeoutMs: 8765 }, timeoutMs: 9765 }
   ]);
 });

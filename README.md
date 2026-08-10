@@ -34,7 +34,9 @@ await Promise.all([laneA.startAnalyze(), laneB.startAnalyze()]);
 ```
 TOML の `[instances.<id>]` で ROM、State、baseline 名などを lane 単位に上書きできます。
 ## 主な API
-`call(command, params)` は `window.DesmumeMCP.call()` の薄いラッパーです。`eval(script)` は現行 `eval` command、`rerunscript(path)` は UTF-8 のローカル JavaScript を読み `runScript` へ渡します。
+Chrome は `--enable-features=WebMCPTesting,DevToolsWebMCPSupport` を付けて起動し、登録済み `document.modelContext` WebMCP を内部 transport として使います。生の WebMCP tool object はハーネス外へ公開しません。
+`call(command, params)` は内部で `desmume.call`、`eval(script)` は `desmume.eval`、`rerunscript(path)` は UTF-8 のローカル JavaScript を読み `desmume.runScript` を実行します。返値は WebMCP の実行結果です。`pause()` と `resume()` もトップレベル helper として `desmume.call` を経由します。
+ROM/State の transaction serial 待ちや baseline 作成など、ハーネス自身が機械判定に structured object を必要とする内部処理だけは、外部公開しない direct page bridge を使用します。
 `rerunPScript(path, asyncMode, name?)` は Persistent Scripts 用です。明示 name が既存なら `listScripts` から該当 id を見つけ `stopScript` で停止し、最新 snapshot を取り、`Load source` file input へローカルファイルを投入し、エディタへ UTF-8 source が反映されたことを確認してから `runLoadedPersistentScript` を直接呼びます。`Run / Update` ボタンの click、DOM click、座標操作は使いません。
 ```js
 await lane.rerunPScript("C:\\scripts\\battle_observer.js", false, "battle_observer_mcp");

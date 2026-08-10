@@ -36,11 +36,24 @@ export class DesmumeHarness {
 
   async call(command, params = {}, timeoutMs = this.config.commandTimeoutMs) {
     await this.start();
-    return await this.session.callMcp(command, params, timeoutMs);
+    return await this.session.callWebMcp("desmume.call", { command, params }, timeoutMs);
   }
 
   async status() {
     return await this.call("status");
+  }
+
+  async pause() {
+    return await this.call("pause");
+  }
+
+  async resume() {
+    return await this.call("resume");
+  }
+
+  async #directCall(command, params = {}, timeoutMs = this.config.commandTimeoutMs) {
+    await this.start();
+    return await this.session.callDirect(command, params, timeoutMs);
   }
 
   async snapshotElements() {
@@ -52,7 +65,7 @@ export class DesmumeHarness {
     const deadline = Date.now() + timeoutMs;
     let latest = null;
     while (Date.now() < deadline) {
-      latest = await this.call("status", {}, Math.min(this.config.commandTimeoutMs, 5000));
+      latest = await this.#directCall("status", {}, Math.min(this.config.commandTimeoutMs, 5000));
       if (latest?.ok !== false && predicate(latest)) return latest;
       await sleep(25);
     }
@@ -63,7 +76,7 @@ export class DesmumeHarness {
   async loadRom(filePath = this.config.romPath) {
     await this.start();
     if (!filePath) throw new Error("rom_path is not configured");
-    const before = requireOk(await this.call("status"), "status before ROM load");
+    const before = requireOk(await this.#directCall("status"), "status before ROM load");
     const previousTransactionSerial = Number(before.fileTransaction?.serial ?? 0);
     await this.session.uploadFileByLabel("ROM", filePath);
     return await this.#waitForStatus(
@@ -77,7 +90,7 @@ export class DesmumeHarness {
   async loadState(filePath = this.config.statePath) {
     await this.start();
     if (!filePath) throw new Error("state_path is not configured");
-    const before = requireOk(await this.call("status"), "status before State load");
+    const before = requireOk(await this.#directCall("status"), "status before State load");
     const previousSerial = Number(before.stateLoadSerial ?? 0);
     await this.session.uploadFileByLabel("State In", filePath);
     return await this.#waitForStatus(
@@ -87,11 +100,11 @@ export class DesmumeHarness {
   }
 
   async saveBaseline(name = this.config.baselineName, replace = this.config.replaceBaseline) {
-    return requireOk(await this.call("saveAnalysisBaseline", { name, replace }), "saveAnalysisBaseline");
+    return requireOk(await this.#directCall("saveAnalysisBaseline", { name, replace }), "saveAnalysisBaseline");
   }
 
   async restoreBaseline(name = this.config.baselineName) {
-    return requireOk(await this.call("restoreAnalysisBaseline", { name }), "restoreAnalysisBaseline");
+    return requireOk(await this.#directCall("restoreAnalysisBaseline", { name }), "restoreAnalysisBaseline");
   }
 
   async startAnalyze() {
@@ -101,7 +114,7 @@ export class DesmumeHarness {
     const afterRom = await this.snapshotElements();
     const stateStatus = await this.loadState();
     const baseline = await this.saveBaseline();
-    const context = requireOk(await this.call("snapshotContext"), "snapshotContext");
+    const context = requireOk(await this.#directCall("snapshotContext"), "snapshotContext");
     return {
       isolationId: this.isolationId,
       baseline,
@@ -119,30 +132,32 @@ export class DesmumeHarness {
 
   async eval(script, timeoutMs = this.config.commandTimeoutMs) {
     if (typeof script !== "string") throw new Error("eval script must be a string");
-    return requireOk(await this.call("eval", { code: script, timeoutMs }, timeoutMs + 1000), "eval");
+    await this.start();
+    return await this.session.callWebMcp("desmume.eval", { code: script, timeoutMs }, timeoutMs + 1000);
   }
 
   async rerunscript(filePath, timeoutMs = this.config.commandTimeoutMs) {
     const absolute = path.resolve(filePath);
     const code = await readUtf8Text(absolute);
-    return requireOk(await this.call("runScript", { code, timeoutMs }, timeoutMs + 1000), "runScript");
+    await this.start();
+    return await this.session.callWebMcp("desmume.runScript", { code, timeoutMs }, timeoutMs + 1000);
   }
 
   async listScripts() {
-    return requireOk(await this.call("listScripts"), "listScripts");
+    return requireOk(await this.#directCall("listScripts"), "listScripts");
   }
 
   async stopPscript(selector) {
     const params = selectorParams(selector);
-    if (params.id !== undefined) return requireOk(await this.call("stopScript", params), "stopScript");
+    if (params.id !== undefined) return requireOk(await this.#directCall("stopScript", params), "stopScript");
     const listed = await this.listScripts();
     const script = listed.scripts?.find((candidate) => candidate.name === params.name);
     if (!script) return { ok: true, stopped: false, name: params.name, reason: "not-found" };
-    return requireOk(await this.call("stopScript", { id: script.id }), "stopScript");
+    return requireOk(await this.#directCall("stopScript", { id: script.id }), "stopScript");
   }
 
   async restartPscript(selector, { waitForRegistration = true, startupTimeoutMs = 10000 } = {}) {
-    return requireOk(await this.call("restartScript", {
+    return requireOk(await this.#directCall("restartScript", {
       ...selectorParams(selector),
       waitForRegistration,
       startupTimeoutMs
@@ -162,7 +177,7 @@ export class DesmumeHarness {
       if (typeof name !== "string" || !name.trim()) throw new Error("name must be a non-empty string when provided");
       const listed = await this.listScripts();
       const existing = listed.scripts?.find((candidate) => candidate.name === name);
-      if (existing) stopped = requireOk(await this.call("stopScript", { id: existing.id }), "stopScript before rerunPScript");
+      if (existing) stopped = requireOk(await this.#directCall("stopScript", { id: existing.id }), "stopScript before rerunPScript");
     }
     const snapshot = await this.snapshotElements();
     await this.session.uploadFileByLabel("Load source", absolute);
@@ -174,7 +189,7 @@ export class DesmumeHarness {
     };
     if (name !== undefined) params.name = name;
     const script = requireOk(
-      await this.call("runLoadedPersistentScript", params, timeoutMs),
+      await this.#directCall("runLoadedPersistentScript", params, timeoutMs),
       "runLoadedPersistentScript"
     );
     return { ok: true, stopped, script, snapshot };
@@ -182,7 +197,7 @@ export class DesmumeHarness {
 
   async listPScriptMcp(scriptId) {
     const params = scriptId === undefined ? {} : { scriptId };
-    return requireOk(await this.call("listPScriptMcp", params), "listPScriptMcp");
+    return requireOk(await this.#directCall("listPScriptMcp", params), "listPScriptMcp");
   }
 
   async callPScriptMcp(name, params = {}, {
@@ -194,7 +209,7 @@ export class DesmumeHarness {
     const request = { name, params, blocking, timeoutMs };
     if (scriptId !== undefined) request.scriptId = scriptId;
     if (scriptName !== undefined) request.scriptName = scriptName;
-    return requireOk(await this.call("callPScriptMcp", request, timeoutMs + 1000), "callPScriptMcp");
+    return requireOk(await this.#directCall("callPScriptMcp", request, timeoutMs + 1000), "callPScriptMcp");
   }
 
   async close() {
