@@ -29,6 +29,9 @@ export class DesmumeHarness {
     this.config = config;
     this.session = sessionFactory({ isolationId, config });
     this.screenshotSerial = 0;
+    this.currentStatePath = null;
+    this.currentBaselineName = config.baselineName;
+    this.scriptSourcePaths = new Map();
   }
 
   async start() {
@@ -43,6 +46,10 @@ export class DesmumeHarness {
 
   async status() {
     return await this.call("status");
+  }
+
+  async directStatus() {
+    return requireOk(await this.#directCall("status"), "status");
   }
 
   async pause() {
@@ -94,19 +101,26 @@ export class DesmumeHarness {
     if (typeof filePath !== "string" || !filePath.trim()) throw new Error("state_path is required");
     const before = requireOk(await this.#directCall("status"), "status before State load");
     const previousSerial = Number(before.stateLoadSerial ?? 0);
+    const absolute = path.resolve(filePath);
     await this.session.uploadFileByLabel("State In", filePath);
-    return await this.#waitForStatus(
+    const loaded = await this.#waitForStatus(
       (status) => Number(status.stateLoadSerial ?? 0) > previousSerial && status.fileTransaction?.active === false,
       "State load"
     );
+    this.currentStatePath = absolute;
+    return loaded;
   }
 
   async saveBaseline(name = this.config.baselineName, replace = this.config.replaceBaseline) {
-    return requireOk(await this.#directCall("saveAnalysisBaseline", { name, replace }), "saveAnalysisBaseline");
+    const saved = requireOk(await this.#directCall("saveAnalysisBaseline", { name, replace }), "saveAnalysisBaseline");
+    this.currentBaselineName = name;
+    return saved;
   }
 
   async restoreBaseline(name = this.config.baselineName) {
-    return requireOk(await this.#directCall("restoreAnalysisBaseline", { name }), "restoreAnalysisBaseline");
+    const restored = requireOk(await this.#directCall("restoreAnalysisBaseline", { name }), "restoreAnalysisBaseline");
+    this.currentBaselineName = name;
+    return restored;
   }
 
   async startAnalyze(statePath) {
@@ -227,7 +241,90 @@ export class DesmumeHarness {
       await this.#directCall("runLoadedPersistentScript", params, timeoutMs),
       "runLoadedPersistentScript"
     );
+    if (Number.isSafeInteger(script.id)) this.scriptSourcePaths.set(script.id, absolute);
     return { ok: true, stopped, script, snapshot };
+  }
+
+  async rerunPScriptConsole(filePath, asyncMode = false, name, {
+    waitForRegistration = true,
+    startupTimeoutMs = 10000,
+    timeoutMs = this.config.commandTimeoutMs,
+    max = 20
+  } = {}) {
+    if (typeof asyncMode !== "boolean") throw new Error("asyncMode must be boolean");
+    const absolute = path.resolve(filePath);
+    const code = await readUtf8Text(absolute);
+    const params = { code, asyncMode, waitForRegistration, startupTimeoutMs };
+    if (name !== undefined) params.name = name;
+    const script = requireOk(
+      await this.#directCall("runPersistentScript", params, timeoutMs),
+      "runPersistentScript"
+    );
+    const id = script?.id;
+    if (Number.isSafeInteger(id)) this.scriptSourcePaths.set(id, absolute);
+    const printed = requireOk(await this.#directCall("listScriptPrint", {
+      ...(Number.isSafeInteger(id) ? { id } : {}),
+      max
+    }), "listScriptPrint");
+    return {
+      ok: true,
+      script,
+      logs: printed.logs ?? []
+    };
+  }
+
+  async scriptConsole(scriptId, max = 20) {
+    if (!Number.isSafeInteger(scriptId) || scriptId < 1) throw new Error("script_id must be a positive integer");
+    if (!Number.isSafeInteger(max) || max < 1 || max > 1000) throw new Error("max must be an integer from 1 through 1000");
+    return requireOk(await this.#directCall("listScriptPrint", { id: scriptId, max }), "listScriptPrint");
+  }
+
+  async analysisContext({ includeBreakpoints = false } = {}) {
+    const status = await this.directStatus();
+    const snapshot = status.romLoaded
+      ? requireOk(await this.#directCall("snapshotContext"), "snapshotContext")
+      : null;
+    const baselineList = await this.#directCall("listAnalysisBaselines");
+    const scriptList = await this.#directCall("listScripts");
+    const breakKinds = ["exec", "read", "write", "dataAbort", "prefetchAbort", "undefinedInstruction"];
+    const lastBreak = status.native?.lastBreak?.hit ? status.native.lastBreak : null;
+    const latestState = status.recentFiles?.find((entry) => entry?.kind === "state") ?? null;
+    const scripts = (scriptList?.scripts ?? []).filter((script) => script.running === true).map((script) => ({
+      id: script.id,
+      name: script.name,
+      running: script.running,
+      started: script.started,
+      registrationComplete: script.registrationComplete,
+      identitySource: script.identitySource,
+      asyncMode: script.asyncMode,
+      mcpCount: script.mcpCount,
+      ...(this.scriptSourcePaths.has(script.id) ? { sourcePath: this.scriptSourcePaths.get(script.id) } : {})
+    }));
+    const result = {
+      isolationId: this.isolationId,
+      stateName: this.currentStatePath ? path.basename(this.currentStatePath) : latestState?.name ?? null,
+      statePath: this.currentStatePath,
+      baselineName: this.currentBaselineName,
+      baselinePresent: (baselineList?.baselines ?? []).some((baseline) => baseline.name === this.currentBaselineName),
+      paused: status.paused,
+      running: status.running,
+      frame: status.frame,
+      pc: status.native?.arm9?.pc,
+      cpsr: status.native?.arm9?.cpsr,
+      traceEnabled: status.native?.traceEnabled,
+      skipIrq: snapshot?.skipIrq,
+      ...(lastBreak ? {
+        break: {
+          kind: breakKinds[Number(lastBreak.kind)] ?? "unknown",
+          cpu: lastBreak.cpu,
+          address: Number(lastBreak.address) >>> 0,
+          pc: Number(lastBreak.pc) >>> 0
+        }
+      } : { break: null }),
+      scripts
+    };
+    if (includeBreakpoints) result.breakpoints = await this.#directCall("listBreakpoints");
+    return result;
   }
 
   async listPScriptMcp(scriptId) {

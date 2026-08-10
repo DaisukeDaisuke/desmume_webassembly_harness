@@ -157,6 +157,11 @@ class FakeScriptSession {
       assert.equal(params.asyncMode, false);
       return { ok: true, id: 8, name: "observer", running: true, started: true, registrationComplete: true };
     }
+    if (command === "listScriptPrint") {
+      assert.equal(params.id, 8);
+      assert.equal(params.max, 20);
+      return { ok: true, logs: [{ id: 8, name: "observer", text: "ready" }] };
+    }
     throw new Error(`unexpected command ${command}`);
   }
   async close() {}
@@ -183,6 +188,120 @@ test("rerunPScript stops the same explicit name and directly starts the source l
     "editor-ready",
     "mcp:runLoadedPersistentScript"
   ]);
+});
+
+test("rerunPScriptConsole skips UI snapshot output and returns startup console in one harness call", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "desmume-harness-console-"));
+  const scriptPath = path.join(directory, "observer.js");
+  const source = "print('ready');\n";
+  await writeFile(scriptPath, source, "utf8");
+  const fake = {
+    events: [],
+    async start() {},
+    async callDirect(command, params) {
+      this.events.push(`mcp:${command}`);
+      if (command === "runPersistentScript") {
+        assert.equal(params.name, "observer");
+        assert.equal(params.code, source);
+        assert.equal(params.asyncMode, false);
+        assert.equal(params.waitForRegistration, true);
+        return { ok: true, id: 8, name: "observer", running: true, started: true, registrationComplete: true, mcpCount: 0 };
+      }
+      if (command === "listScriptPrint") {
+        assert.equal(params.id, 8);
+        assert.equal(params.max, 20);
+        return { ok: true, logs: [{ id: 8, name: "observer", text: "ready" }] };
+      }
+      throw new Error(`unexpected command ${command}`);
+    },
+    async close() {}
+  };
+  const harness = new DesmumeHarness({
+    isolationId: "lane-console",
+    config: config(),
+    sessionFactory: () => fake
+  });
+  const result = await harness.rerunPScriptConsole(scriptPath, false, "observer");
+  assert.equal(result.script.id, 8);
+  assert.deepEqual(result.logs, [{ id: 8, name: "observer", text: "ready" }]);
+  assert.equal(Object.hasOwn(result, "snapshot"), false);
+  assert.deepEqual(fake.events, [
+    "mcp:runPersistentScript",
+    "mcp:listScriptPrint"
+  ]);
+});
+
+test("scriptConsole reads one persistent-script console directly by id", async () => {
+  const session = {
+    async start() {},
+    async callDirect(command, params) {
+      assert.equal(command, "listScriptPrint");
+      assert.deepEqual(params, { id: 12, max: 7 });
+      return { logs: [{ id: 12, name: "overlay", text: "slot 0: nil" }] };
+    },
+    async close() {}
+  };
+  const harness = new DesmumeHarness({
+    isolationId: "lane-console-read",
+    config: config(),
+    sessionFactory: () => session
+  });
+  assert.deepEqual(await harness.scriptConsole(12, 7), {
+    logs: [{ id: 12, name: "overlay", text: "slot 0: nil" }]
+  });
+});
+
+test("analysisContext stays compact and omits call stack, disassembly, and breakpoint list by default", async () => {
+  const session = {
+    async start() {},
+    async callDirect(command) {
+      if (command === "status") return {
+        ok: true,
+        romLoaded: true,
+        paused: true,
+        running: false,
+        frame: 123,
+        recentFiles: [{ kind: "state", name: "fallback.dst" }],
+        native: {
+          traceEnabled: true,
+          arm9: { pc: 0x02012344, cpsr: 0x6000001f },
+          lastBreak: { hit: true, kind: 0, cpu: "arm9", address: 0x02012344, pc: 0x02012344 }
+        }
+      };
+      if (command === "snapshotContext") return { ok: true, skipIrq: true, nearPc: ["must-not-escape"] };
+      if (command === "listAnalysisBaselines") return { baselines: [{ name: "analysis-start" }] };
+      if (command === "listScripts") return { scripts: [
+        { id: 3, name: "overlay", running: true, started: true, registrationComplete: true, mcpCount: 0 },
+        { id: 4, name: "stopped", running: false }
+      ] };
+      if (command === "listBreakpoints") return [{ id: 1, type: "exec", address: 0x02012344 }];
+      throw new Error(`unexpected command ${command}`);
+    },
+    async close() {}
+  };
+  const harness = new DesmumeHarness({
+    isolationId: "lane-context",
+    config: config(),
+    sessionFactory: () => session
+  });
+  harness.currentStatePath = path.resolve("C:\\states\\current.dst");
+  harness.scriptSourcePaths.set(3, path.resolve("C:\\scripts\\overlay.js"));
+  const result = await harness.analysisContext();
+  assert.equal(result.stateName, path.basename(path.resolve("C:\\states\\current.dst")));
+  assert.equal(result.baselineName, "analysis-start");
+  assert.equal(result.baselinePresent, true);
+  assert.equal(result.paused, true);
+  assert.equal(result.running, false);
+  assert.equal(result.break.kind, "exec");
+  assert.equal(result.skipIrq, true);
+  assert.equal(result.scripts.length, 1);
+  assert.equal(result.scripts[0].id, 3);
+  assert.equal(Object.hasOwn(result, "breakpoints"), false);
+  assert.equal(Object.hasOwn(result, "callStack"), false);
+  assert.equal(Object.hasOwn(result, "disassembly"), false);
+  assert.equal(Object.hasOwn(result, "nearPc"), false);
+  const withBreakpoints = await harness.analysisContext({ includeBreakpoints: true });
+  assert.deepEqual(withBreakpoints.breakpoints, [{ id: 1, type: "exec", address: 0x02012344 }]);
 });
 
 class FakeWebMcpSession {

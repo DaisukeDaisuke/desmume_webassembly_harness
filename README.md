@@ -40,12 +40,16 @@ tool_output_token_limit = 1000000
 ## Codexから見えるMCP tools
 - `start_analyze`: `state_path` を引数で受け、Chrome起動または既存lane再利用、初回snapshot、ROM読込、再snapshot、State読込、analysis baseline作成まで行う。
 - `status`: 現在のDeSmuME状態を取得する。
+- `direct_status`: WebMCP transportを挟まずdocumented browser APIから現在のDeSmuME statusを直接取得する。
+- `analysis_context`: チャットを跨いで作業を再開するための小さい状況要約を返す。State/baseline、pause/run、frame、ARM9 PC/CPSR、最新break、起動中Persistent Scriptだけを含み、call stackやdisassemblyは含めない。
 - `pause`: エミュレータを停止する。
 - `resume`: エミュレータを再開する。
 - `call`: 任意のDeSmuME commandを呼ぶ。
 - `eval`: `desmume.eval` 相当のisolated JavaScriptを実行する。
 - `rerun_script`: UTF-8 JavaScriptファイルを読み、`desmume.runScript` 相当で実行する。
 - `rerun_pscript`: Persistent Scriptのsourceを読み込み、同名scriptがあれば停止してから直接 `runLoadedPersistentScript` を実行する。
+- `rerun_pscript_console`: Persistent Scriptを読み込み・起動し、そのscriptの最新 `print(...)` 出力まで1回のMCP callで返す。
+- `script_console`: 起動中Persistent Scriptの `script_id` を指定して最新 `print(...)` / `printf(...)` 出力だけをdirect `listScriptPrint` で取得する。
 - `stop_pscript`: Persistent Scriptを停止する。
 - `restart_pscript`: Persistent Scriptを再起動する。
 - `snapshot_elements`: 現在の操作要素と位置を取得する。
@@ -68,6 +72,18 @@ start_analyze { isolation_id: "lane-a", state_path: "C:\\dq9\\states\\battle-a.d
 6. 呼び出し引数 `state_path` のStateをfile inputへローカル投入し、`stateLoadSerial` 増加とfile transaction完了まで待つ。
 7. State読込直後の状態を `saveAnalysisBaseline` で保存する。baseline作成のために余計なframeは進めない。
 8. `snapshotContext` を取得して返す。
+
+## チャットを跨いで作業を再開する
+`analysis_context` は再開に必要な情報だけを小さく返します。通常はbreakpoint一覧も省略し、必要な場合だけ `include_breakpoints: true` を指定します。call stack、disassembly、script source、console全文は自動では含めません。
+
+返す主な情報は `stateName` / `statePath` / `baselineName` / `baselinePresent` / `paused` / `running` / `frame` / ARM9 `pc` / `cpsr` / 最新 `break` / 起動中 `scripts` です。Harness経由で起動したPersistent Scriptには把握できる場合 `sourcePath` も付きます。
+
+`direct_status` はDeSmuMEのdocumented `status` commandをbrowser API bridgeから直接呼びます。WebMCP transport wrapperを経由した `status` が不要な内部・機械処理向けです。
+
+## Persistent Scriptの最短console取得
+`overlay_jp.js` のように `print(...)` を使うPersistent Scriptでは、`rerun_pscript_console` を使うとローカルsource読込、direct `runPersistentScript`、direct `listScriptPrint` を1回のstdio MCP callにまとめられます。Persistent Scripts editorや巨大なUI snapshotは経由しません。
+
+以後のconsole取得は `analysis_context` に出る `script_id` を `script_console` に渡せば、scriptを再実行せずdirect `listScriptPrint` 1回だけで取得できます。
 ## 複数エミュレータ
 すべての主要toolは `isolation_id` を受け取ります。異なる `isolation_id` は別Chrome profileと別DevTools portを使用するため、同じstdio MCPプロセスから複数DeSmuMEを同時に保持できます。
 ```text

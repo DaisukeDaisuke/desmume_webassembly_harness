@@ -5,7 +5,7 @@ import { HarnessManager } from "./manager.js";
 import { compactOutputText } from "./compact-output.js";
 
 const SERVER_NAME = "desmume-webassembly-harness";
-const SERVER_VERSION = "0.3.2";
+const SERVER_VERSION = "0.3.3";
 const SUPPORTED_PROTOCOLS = new Set([
   "2025-11-25",
   "2025-06-18",
@@ -49,6 +49,21 @@ const TOOLS = Object.freeze([
     name: "status",
     description: "Return DeSmuME status through the page's registered desmume.call WebMCP tool.",
     inputSchema: objectSchema({ isolation_id: isolationProperty }),
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: "direct_status",
+    description: "Return DeSmuME status through the documented direct page API without the inner WebMCP transport layer.",
+    inputSchema: objectSchema({ isolation_id: isolationProperty }),
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: "analysis_context",
+    description: "Return a compact cross-chat continuation context: State/baseline identity, pause/run state, frame, ARM9 PC/CPSR, latest break, and running persistent scripts. Call stack and disassembly are intentionally omitted.",
+    inputSchema: objectSchema({
+      isolation_id: isolationProperty,
+      include_breakpoints: { type: "boolean", default: false, description: "Include the current breakpoint list only when explicitly needed." }
+    }),
     annotations: { readOnlyHint: true }
   },
   {
@@ -101,6 +116,30 @@ const TOOLS = Object.freeze([
       startup_timeout_ms: timeoutProperty,
       timeout_ms: timeoutProperty
     }, ["path"])
+  },
+  {
+    name: "rerun_pscript_console",
+    description: "Read one local persistent-script source, start it through runPersistentScript, then return its startup summary and latest console print lines in the same MCP call.",
+    inputSchema: objectSchema({
+      isolation_id: isolationProperty,
+      path: { type: "string", minLength: 1 },
+      async_mode: { type: "boolean", default: false },
+      name: { type: "string", minLength: 1, maxLength: 64 },
+      wait_for_registration: { type: "boolean", default: true },
+      startup_timeout_ms: timeoutProperty,
+      timeout_ms: timeoutProperty,
+      max: { type: "integer", minimum: 1, maximum: 1000, default: 20 }
+    }, ["path"])
+  },
+  {
+    name: "script_console",
+    description: "Return the latest print/printf console lines for one running persistent script through direct listScriptPrint.",
+    inputSchema: objectSchema({
+      isolation_id: isolationProperty,
+      script_id: { type: "integer", minimum: 1 },
+      max: { type: "integer", minimum: 1, maximum: 1000, default: 20 }
+    }, ["script_id"]),
+    annotations: { readOnlyHint: true }
   },
   {
     name: "stop_pscript",
@@ -297,6 +336,12 @@ export class McpHarnessServer {
         return await this.manager.startAnalyze(optionalIsolation(args), args.state_path);
       case "status":
         return await (await this.#harness(args)).status();
+      case "direct_status":
+        return await (await this.#harness(args)).directStatus();
+      case "analysis_context":
+        return await (await this.#harness(args)).analysisContext({
+          includeBreakpoints: args.include_breakpoints ?? false
+        });
       case "pause":
         return await (await this.#harness(args)).pause();
       case "resume":
@@ -333,6 +378,30 @@ export class McpHarnessServer {
             timeoutMs: optionalTimeout(args, "timeout_ms", harness.config.commandTimeoutMs)
           }
         );
+      }
+      case "rerun_pscript_console": {
+        if (typeof args.path !== "string" || !args.path.trim()) throw new Error("path is required");
+        const harness = await this.#harness(args);
+        const max = args.max === undefined ? 20 : Number(args.max);
+        if (!Number.isSafeInteger(max) || max < 1 || max > 1000) throw new Error("max must be an integer from 1 through 1000");
+        return await harness.rerunPScriptConsole(
+          args.path,
+          args.async_mode ?? false,
+          args.name,
+          {
+            waitForRegistration: args.wait_for_registration ?? true,
+            startupTimeoutMs: optionalTimeout(args, "startup_timeout_ms", 10000),
+            timeoutMs: optionalTimeout(args, "timeout_ms", harness.config.commandTimeoutMs),
+            max
+          }
+        );
+      }
+      case "script_console": {
+        const scriptId = Number(args.script_id);
+        if (!Number.isSafeInteger(scriptId) || scriptId < 1) throw new Error("script_id must be a positive integer");
+        const max = args.max === undefined ? 20 : Number(args.max);
+        if (!Number.isSafeInteger(max) || max < 1 || max > 1000) throw new Error("max must be an integer from 1 through 1000");
+        return await (await this.#harness(args)).scriptConsole(scriptId, max);
       }
       case "stop_pscript":
         return await (await this.#harness(args)).stopPscript(scriptSelector(args));
@@ -393,7 +462,7 @@ export class McpHarnessServer {
           title: "DeSmuME WebAssembly Harness",
           version: SERVER_VERSION
         },
-        instructions: "Pass state_path to every start_analyze call. Reusing an isolation_id reuses its Chrome instance. Use a distinct isolation_id for each simultaneous emulator. screenshot saves only the DeSmuME framebuffer to screenshot_path from harness.toml. eval and rerun_script are transported through the page WebMCP tools; persistent-script lifecycle operations call the documented DeSmuME API directly and never click Run/Update in the UI."
+        instructions: "Pass state_path to every start_analyze call. Reusing an isolation_id reuses its Chrome instance. Use analysis_context when continuing work across chats; it intentionally omits call stack/disassembly. Use direct_status for raw status without the inner WebMCP transport. screenshot saves only the DeSmuME framebuffer to screenshot_path from harness.toml. Use rerun_pscript_console to start a persistent script and get initial print output in one call, then script_console for later console reads by script_id."
       });
     }
     if (message.method === "ping") return response(id, {});

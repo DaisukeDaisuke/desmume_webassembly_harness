@@ -78,6 +78,99 @@ test("start_analyze forwards a caller-supplied state_path for repeated starts on
   ]);
 });
 
+test("direct_status and analysis_context route to compact direct harness helpers", async () => {
+  const calls = [];
+  const harness = {
+    config: { commandTimeoutMs: 600000, baselineName: "base", replaceBaseline: true },
+    async directStatus() {
+      calls.push("directStatus");
+      return { ok: true, paused: true, running: false };
+    },
+    async analysisContext(options) {
+      calls.push({ analysisContext: options });
+      return { isolationId: "lane-a", stateName: "a.dst", paused: true, running: false, scripts: [] };
+    }
+  };
+  const manager = {
+    async create(id) {
+      assert.equal(id, "lane-a");
+      return harness;
+    },
+    async closeAll() {}
+  };
+  const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
+  const directReply = await server.handle({
+    jsonrpc: "2.0",
+    id: 21,
+    method: "tools/call",
+    params: { name: "direct_status", arguments: { isolation_id: "lane-a" } }
+  });
+  assert.equal(directReply.result.structuredContent.paused, true);
+  const contextReply = await server.handle({
+    jsonrpc: "2.0",
+    id: 22,
+    method: "tools/call",
+    params: { name: "analysis_context", arguments: { isolation_id: "lane-a", include_breakpoints: true } }
+  });
+  assert.equal(contextReply.result.structuredContent.stateName, "a.dst");
+  assert.deepEqual(calls, ["directStatus", { analysisContext: { includeBreakpoints: true } }]);
+});
+
+test("rerun_pscript_console returns startup logs through one stdio MCP tool", async () => {
+  const harness = {
+    config: { commandTimeoutMs: 600000, baselineName: "base", replaceBaseline: true },
+    async rerunPScriptConsole(filePath, asyncMode, name, options) {
+      assert.equal(filePath, "C:\\scripts\\overlay.js");
+      assert.equal(asyncMode, false);
+      assert.equal(name, "overlay");
+      assert.equal(options.max, 7);
+      return { ok: true, script: { id: 9, name: "overlay", running: true }, logs: [{ id: 9, name: "overlay", text: "ready" }] };
+    }
+  };
+  const manager = {
+    async create() { return harness; },
+    async closeAll() {}
+  };
+  const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
+  const reply = await server.handle({
+    jsonrpc: "2.0",
+    id: 23,
+    method: "tools/call",
+    params: {
+      name: "rerun_pscript_console",
+      arguments: { path: "C:\\scripts\\overlay.js", name: "overlay", max: 7 }
+    }
+  });
+  assert.equal(reply.result.structuredContent.script.id, 9);
+  assert.equal(reply.result.structuredContent.logs[0].text, "ready");
+});
+
+test("script_console routes a bounded direct console read by script id", async () => {
+  const harness = {
+    config: { commandTimeoutMs: 600000, baselineName: "base", replaceBaseline: true },
+    async scriptConsole(scriptId, max) {
+      assert.equal(scriptId, 4);
+      assert.equal(max, 9);
+      return { logs: [{ id: 4, name: "overlay", text: "ready" }] };
+    }
+  };
+  const manager = {
+    async create() { return harness; },
+    async closeAll() {}
+  };
+  const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
+  const reply = await server.handle({
+    jsonrpc: "2.0",
+    id: 24,
+    method: "tools/call",
+    params: {
+      name: "script_console",
+      arguments: { script_id: 4, max: 9 }
+    }
+  });
+  assert.equal(reply.result.structuredContent.logs[0].text, "ready");
+});
+
 test("stdio MCP initialize returns server instructions and negotiates the requested supported protocol", async () => {
   const server = new McpHarnessServer({
     configPath: "harness.toml",
