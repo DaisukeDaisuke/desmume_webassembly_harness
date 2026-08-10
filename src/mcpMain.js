@@ -5,7 +5,7 @@ import { HarnessManager } from "./manager.js";
 import { compactOutputText } from "./compact-output.js";
 
 const SERVER_NAME = "desmume-webassembly-harness";
-const SERVER_VERSION = "0.3.1";
+const SERVER_VERSION = "0.3.2";
 const SUPPORTED_PROTOCOLS = new Set([
   "2025-11-25",
   "2025-06-18",

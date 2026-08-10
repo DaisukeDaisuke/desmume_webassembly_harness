@@ -39,3 +39,10 @@ test("state_path is rejected in harness.toml because it is supplied per start_an
     /pass state_path to start_analyze/u
   );
 });
+
+test("default screenshot directory avoids dot-prefixed folders for Codex sandbox access", () => {
+  const configPath = path.join("C:\\workspace", "harness.toml");
+  const resolved = resolveHarnessConfig({}, configPath);
+  assert.equal(resolved.screenshotPath, path.resolve(path.dirname(path.resolve(configPath)), "harness/screenshots"));
+  assert.equal(resolved.screenshotPath.includes(`${path.sep}.harness${path.sep}`), false);
+});

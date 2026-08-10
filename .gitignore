@@ -1,3 +1,4 @@
 .harness/
+harness/screenshots/
 harness.toml
 /.idea

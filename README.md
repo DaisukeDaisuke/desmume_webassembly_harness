@@ -10,7 +10,7 @@
 `harness.example.toml` を `harness.toml` にコピーし、ROM とスクリーンショット保存先を設定します。State は設定ファイルには置かず、`start_analyze` の呼び出しごとに外部指定します。Windows パスは TOML literal string としてシングルクォートで囲めます。
 ```toml
 rom_path = 'C:\dq9\rom.nds'
-screenshot_path = 'C:\dq9\screenshots'
+screenshot_path = 'harness/screenshots'
 baseline_name = 'battle-start'
 ```
 `harness.toml` と Chrome の分離プロファイル `.harness/` は Git 対象外です。
@@ -78,13 +78,13 @@ start_analyze { isolation_id: "lane-b", state_path: "C:\\dq9\\states\\b.dst" }
 ```toml
 [instances.lane-a]
 baseline_name = 'battle-a'
-screenshot_path = 'C:\dq9\screenshots\lane-a'
+screenshot_path = 'harness/screenshots/lane-a'
 [instances.lane-b]
 baseline_name = 'battle-b'
-screenshot_path = 'C:\dq9\screenshots\lane-b'
+screenshot_path = 'harness/screenshots/lane-b'
 ```
 ## フレームスクリーンショット
-`screenshot` はブラウザやChromeウインドウのキャプチャではなく、DeSmuME本体の `takeScreenshot` が `ui.screen.toDataURL()` で生成する256x384のDSキャンバスPNGだけを保存します。`screenshot_path` は保存ディレクトリです。呼び出し時に `name` を省略すると `frame-000001.png`, `frame-000002.png`, ... とlaneごとに自動採番し、`name: "battle-start"` のように指定すると `battle-start.png` として保存します。PNG本体のdata URLはMCP出力へ返しません。
+`screenshot` はブラウザやChromeウインドウのキャプチャではなく、DeSmuME本体の `takeScreenshot` が `ui.screen.toDataURL()` で生成する256x384のDSキャンバスPNGだけを保存します。`screenshot_path` は保存ディレクトリで、デフォルトはCodex sandboxから参照しやすい `harness/screenshots` です。呼び出し時に `name` を省略すると `frame-000001.png`, `frame-000002.png`, ... とlaneごとに自動採番し、`name: "battle-start"` のように指定すると `battle-start.png` として保存します。PNG本体のdata URLはMCP出力へ返しません。MCPの返り値 `path` は保存したPNGの絶対パスです。
 
 State読込直後はAPI_CURRENTの仕様上、1つのcomplete emulator frameが進むまで画面capture APIが `SCREEN_INVALID` になります。`start_analyze` は読み込んだStateを厳密に保つため勝手に1フレーム進めません。そのため必要なタイミングでフレームを進めた後に `screenshot` を呼びます。
 ## WebMCP transport
