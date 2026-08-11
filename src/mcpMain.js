@@ -5,7 +5,7 @@ import { HarnessManager } from "./manager.js";
 import { compactOutputText } from "./compact-output.js";
 
 const SERVER_NAME = "desmume-webassembly-harness";
-const SERVER_VERSION = "0.3.4";
+const SERVER_VERSION = "0.4.0";
 const SUPPORTED_PROTOCOLS = new Set([
   "2025-11-25",
   "2025-06-18",
@@ -42,8 +42,9 @@ const TOOLS = Object.freeze([
     description: "Start or reuse an isolated Chrome/DeSmuME instance, load the configured ROM and caller-supplied State, create the configured analysis baseline, and return only status/paused/running.",
     inputSchema: objectSchema({
       isolation_id: isolationProperty,
-      state_path: { type: "string", minLength: 1, description: "Local State file to load for this analysis start." }
-    }, ["state_path"])
+      state_path: { type: "string", minLength: 1, description: "Local State file to load for this analysis start." },
+      save_path: { type: "string", minLength: 1, description: "Local .sav/.dsv file to load instead of a State." }
+    }, [])
   },
   {
     name: "status",
@@ -215,9 +216,24 @@ const TOOLS = Object.freeze([
     }, ["name"])
   },
   {
+    name: "inject_bytes_file",
+    description: "Inject the exact bytes from one absolute local file into emulated memory at the requested starting address.",
+    inputSchema: objectSchema({
+      isolation_id: isolationProperty,
+      address: { oneOf: [{ type: "integer", minimum: 0, maximum: 4294967295 }, { type: "string", minLength: 1 }] },
+      file_path: { type: "string", minLength: 1, description: "Absolute path to a file of at most 1 MiB." },
+      cpu: { type: "string", enum: ["arm9", "arm7"] }
+    }, ["address", "file_path"])
+  },
+  {
     name: "close_instance",
     description: "Close the Chrome/DeSmuME process associated with one isolation id.",
     inputSchema: objectSchema({ isolation_id: isolationProperty })
+  },
+  {
+    name: "close_all_sessions",
+    description: "Close every Chrome/DeSmuME session managed by this MCP process, including kill fallback for managed Chrome children.",
+    inputSchema: objectSchema({})
   }
 ]);
 
@@ -332,8 +348,15 @@ export class McpHarnessServer {
     const args = requireObject(rawArguments, "tool arguments");
     switch (name) {
       case "start_analyze":
-        if (typeof args.state_path !== "string" || !args.state_path.trim()) throw new Error("state_path is required");
-        return await this.manager.startAnalyze(optionalIsolation(args), args.state_path);
+        if ((args.state_path === undefined) === (args.save_path === undefined)) {
+          throw new Error("exactly one of state_path or save_path is required");
+        }
+        if (args.state_path !== undefined && (typeof args.state_path !== "string" || !args.state_path.trim())) throw new Error("state_path must be a non-empty string");
+        if (args.save_path !== undefined && (typeof args.save_path !== "string" || !args.save_path.trim())) throw new Error("save_path must be a non-empty string");
+        return await this.manager.startAnalyze(optionalIsolation(args), {
+          statePath: args.state_path,
+          savePath: args.save_path
+        });
       case "status":
         return await (await this.#harness(args)).status();
       case "direct_status":
@@ -433,8 +456,14 @@ export class McpHarnessServer {
           timeoutMs: optionalTimeout(args, "timeout_ms", 60000)
         });
       }
+      case "inject_bytes_file": {
+        if (typeof args.file_path !== "string" || !args.file_path.trim()) throw new Error("file_path is required");
+        return await (await this.#harness(args)).injectBytesFile(args.file_path, args.address, args.cpu);
+      }
       case "close_instance":
         return { closed: await this.manager.close(optionalIsolation(args)) };
+      case "close_all_sessions":
+        return { closed: await this.manager.closeAll() };
       default:
         throw Object.assign(new Error(`Unknown tool: ${name}`), { protocolCode: -32602 });
     }
@@ -462,7 +491,7 @@ export class McpHarnessServer {
           title: "DeSmuME WebAssembly Harness",
           version: SERVER_VERSION
         },
-        instructions: "Pass state_path to every start_analyze call. Reusing an isolation_id reuses its Chrome instance. Use analysis_context when continuing work across chats; it intentionally omits call stack/disassembly. Use direct_status for raw status without the inner WebMCP transport. screenshot saves only the DeSmuME framebuffer to screenshot_path from harness.toml. Use rerun_pscript_console to start a persistent script and get initial print output in one call, then script_console for later console reads by script_id."
+        instructions: "Pass exactly one of state_path or save_path to every start_analyze call. Startup is accepted only after ROM load reaches running=true; failed starts discard the lane and retry with a fresh Chrome after 500ms. Reusing a healthy isolation_id reuses its Chrome instance. Use analysis_context when continuing work across chats; it intentionally omits call stack/disassembly. Use direct_status for raw status without the inner WebMCP transport. screenshot saves only the DeSmuME framebuffer to screenshot_path from harness.toml. Use inject_bytes_file for bounded absolute-file byte injection. close_all_sessions closes all Chrome children managed by this MCP process."
       });
     }
     if (message.method === "ping") return response(id, {});

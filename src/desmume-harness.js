@@ -1,5 +1,5 @@
 import path from "node:path";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { ChromeSession } from "./chrome-session.js";
 import { readUtf8Text } from "./config.js";
@@ -90,9 +90,11 @@ export class DesmumeHarness {
     await this.session.uploadFileByLabel("ROM", filePath);
     return await this.#waitForStatus(
       (status) => status.romLoaded === true
+        && status.running === true
+        && status.paused === false
         && Number(status.fileTransaction?.serial ?? 0) > previousTransactionSerial
         && status.fileTransaction?.active === false,
-      "ROM load"
+      "ROM load and running startup"
     );
   }
 
@@ -111,6 +113,23 @@ export class DesmumeHarness {
     return loaded;
   }
 
+  async loadSave(filePath) {
+    await this.start();
+    if (typeof filePath !== "string" || !filePath.trim()) throw new Error("save_path is required");
+    const before = requireOk(await this.#directCall("status"), "status before Save load");
+    const previousTransactionSerial = Number(before.fileTransaction?.serial ?? 0);
+    const absolute = path.resolve(filePath);
+    await this.session.uploadFileByLabel("Save In", filePath);
+    const loaded = await this.#waitForStatus(
+      (status) => status.romLoaded === true
+        && Number(status.fileTransaction?.serial ?? 0) > previousTransactionSerial
+        && status.fileTransaction?.active === false,
+      "Save load"
+    );
+    this.currentStatePath = null;
+    return loaded;
+  }
+
   async saveBaseline(name = this.config.baselineName, replace = this.config.replaceBaseline) {
     const saved = requireOk(await this.#directCall("saveAnalysisBaseline", { name, replace }), "saveAnalysisBaseline");
     this.currentBaselineName = name;
@@ -123,16 +142,40 @@ export class DesmumeHarness {
     return restored;
   }
 
-  async startAnalyze(statePath) {
+  async startAnalyze(input) {
+    const statePath = typeof input === "string" ? input : input?.statePath;
+    const savePath = typeof input === "object" && input !== null ? input.savePath : undefined;
+    if ((statePath === undefined) === (savePath === undefined)) {
+      throw new Error("startAnalyze requires exactly one of statePath or savePath");
+    }
     await this.start();
     await this.loadRom();
-    const stateStatus = await this.loadState(statePath);
+    const stateStatus = statePath !== undefined
+      ? await this.loadState(statePath)
+      : await this.loadSave(savePath);
     await this.saveBaseline();
     return {
       status: "ok",
       paused: stateStatus.paused,
       running: stateStatus.running
     };
+  }
+
+  async injectBytesFile(filePath, address, cpu) {
+    if (typeof filePath !== "string" || !path.isAbsolute(filePath)) {
+      throw new Error("file_path must be an absolute path");
+    }
+    const info = await stat(filePath);
+    if (!info.isFile()) throw new Error("file_path must point to a regular file");
+    if (info.size > 1024 * 1024) throw new Error("file_path exceeds the 1 MiB injectBytes limit");
+    const bytes = await readFile(filePath);
+    const params = {
+      address,
+      bytes: [...bytes],
+      name: path.basename(filePath)
+    };
+    if (cpu !== undefined) params.cpu = cpu;
+    return requireOk(await this.#directCall("injectBytes", params), "injectBytes");
   }
 
   async screenshot(name) {

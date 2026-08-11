@@ -47,12 +47,12 @@ test("stdio MCP tool results expose compact text plus one structured object with
   assert.equal(reply.result.isError, false);
 });
 
-test("start_analyze forwards a caller-supplied state_path for repeated starts on the same lane", async () => {
+test("start_analyze forwards caller-supplied State and Save starts on the same lane", async () => {
   const starts = [];
   const manager = {
-    async startAnalyze(isolationId, statePath) {
-      starts.push({ isolationId, statePath });
-      return { ok: true, isolationId, statePath };
+    async startAnalyze(isolationId, input) {
+      starts.push({ isolationId, input });
+      return { ok: true, isolationId, ...input };
     },
     async closeAll() {}
   };
@@ -60,22 +60,58 @@ test("start_analyze forwards a caller-supplied state_path for repeated starts on
     configPath: "harness.toml",
     managerFactory: () => manager
   });
-  for (const [id, statePath] of [[11, "C:\\states\\a.dst"], [12, "C:\\states\\b.dst"]]) {
-    const reply = await server.handle({
-      jsonrpc: "2.0",
-      id,
-      method: "tools/call",
-      params: {
-        name: "start_analyze",
-        arguments: { isolation_id: "lane-a", state_path: statePath }
-      }
-    });
-    assert.equal(reply.result.structuredContent.statePath, statePath);
-  }
+  const stateReply = await server.handle({
+    jsonrpc: "2.0",
+    id: 11,
+    method: "tools/call",
+    params: { name: "start_analyze", arguments: { isolation_id: "lane-a", state_path: "C:\\states\\a.dst" } }
+  });
+  assert.equal(stateReply.result.structuredContent.statePath, "C:\\states\\a.dst");
+  const saveReply = await server.handle({
+    jsonrpc: "2.0",
+    id: 12,
+    method: "tools/call",
+    params: { name: "start_analyze", arguments: { isolation_id: "lane-a", save_path: "C:\\saves\\a.sav" } }
+  });
+  assert.equal(saveReply.result.structuredContent.savePath, "C:\\saves\\a.sav");
   assert.deepEqual(starts, [
-    { isolationId: "lane-a", statePath: "C:\\states\\a.dst" },
-    { isolationId: "lane-a", statePath: "C:\\states\\b.dst" }
+    { isolationId: "lane-a", input: { statePath: "C:\\states\\a.dst", savePath: undefined } },
+    { isolationId: "lane-a", input: { statePath: undefined, savePath: "C:\\saves\\a.sav" } }
   ]);
+});
+
+test("inject_bytes_file and close_all_sessions expose the dedicated top-level operations", async () => {
+  const calls = [];
+  const harness = {
+    config: { commandTimeoutMs: 600000, baselineName: "base", replaceBaseline: true },
+    async injectBytesFile(filePath, address, cpu) {
+      calls.push({ filePath, address, cpu });
+      return { ok: true, size: 4, address: 0x020f9104 };
+    }
+  };
+  const manager = {
+    async create() { return harness; },
+    async closeAll() { return 3; }
+  };
+  const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
+  const injected = await server.handle({
+    jsonrpc: "2.0",
+    id: 13,
+    method: "tools/call",
+    params: {
+      name: "inject_bytes_file",
+      arguments: { file_path: "C:\\build\\arm9.bin", address: "0x020F9104", cpu: "arm9" }
+    }
+  });
+  assert.equal(injected.result.structuredContent.size, 4);
+  assert.deepEqual(calls, [{ filePath: "C:\\build\\arm9.bin", address: "0x020F9104", cpu: "arm9" }]);
+  const closed = await server.handle({
+    jsonrpc: "2.0",
+    id: 14,
+    method: "tools/call",
+    params: { name: "close_all_sessions", arguments: {} }
+  });
+  assert.equal(closed.result.structuredContent.closed, 3);
 });
 
 test("direct_status and analysis_context route to compact direct harness helpers", async () => {

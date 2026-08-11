@@ -111,16 +111,22 @@ export class ChromeSession {
     this.chrome = null;
     this.cdp = null;
     this.port = null;
+    this.targetId = null;
+    this.startupActive = false;
   }
 
   async start() {
     if (this.cdp) return;
+    this.startupActive = true;
     await mkdir(this.profileDir, { recursive: true });
     const chromePath = await findChrome(this.config.chromePath);
     const args = [
       `--user-data-dir=${this.profileDir}`,
       "--remote-debugging-port=0",
       "--enable-features=WebMCPTesting,DevToolsWebMCPSupport",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
       "--no-first-run",
       "--no-default-browser-check",
       "about:blank"
@@ -145,6 +151,7 @@ export class ChromeSession {
     }
     if (!this.port || !page) throw new Error(`Chrome DevTools page did not become available: ${lastError?.message ?? "timeout"}`);
     this.cdp = new CdpClient(page.webSocketDebuggerUrl);
+    this.targetId = page.id ?? null;
     await this.cdp.connect(this.config.startupTimeoutMs);
     await Promise.all([
       this.cdp.send("Page.enable"),
@@ -171,9 +178,31 @@ export class ChromeSession {
       this.config.startupTimeoutMs,
       "DeSmuME WebMCP tools"
     );
+    this.startupActive = false;
+  }
+
+  async ensureWindowUsable() {
+    if (this.startupActive || this.config.headless || !this.cdp || !this.targetId) return false;
+    let current;
+    try {
+      current = await this.cdp.send("Browser.getWindowForTarget", { targetId: this.targetId }, 2000);
+    } catch {
+      return false;
+    }
+    let restored = false;
+    if (current?.bounds?.windowState === "minimized") {
+      await this.cdp.send("Browser.setWindowBounds", {
+        windowId: current.windowId,
+        bounds: { windowState: "normal" }
+      }, 2000);
+      await sleep(50);
+      restored = true;
+    }
+    return restored;
   }
 
   async #callGlobal(functionDeclaration, args = [], { returnByValue = true, timeoutMs = this.config.commandTimeoutMs } = {}) {
+    await this.ensureWindowUsable();
     const globalObject = await this.cdp.send("Runtime.evaluate", { expression: "globalThis", returnByValue: false }, timeoutMs);
     const objectId = globalObject.result?.objectId;
     if (!objectId) throw new Error("Unable to resolve page global object");
@@ -296,6 +325,8 @@ export class ChromeSession {
   async close() {
     const cdp = this.cdp;
     this.cdp = null;
+    this.targetId = null;
+    this.startupActive = false;
     if (cdp) {
       try {
         await cdp.send("Browser.close", {}, 2000);

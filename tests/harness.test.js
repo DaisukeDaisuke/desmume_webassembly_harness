@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { preprocessAssemblySource } from "../src/armv5t-assembly-preprocessor.js";
 import { DesmumeHarness } from "../src/desmume-harness.js";
+import { HarnessManager } from "../src/manager.js";
 
 function config(overrides = {}) {
   return {
@@ -79,6 +81,111 @@ test("startAnalyze loads ROM and State, saves the baseline, and returns only com
   assert.equal(fake.events.some((event) => event.startsWith("snapshot:")), false);
   assert.equal(fake.events.includes("mcp:snapshotContext"), false);
   assert.equal(fake.events.includes("mcp:stepFrames"), false);
+});
+
+test("ROM startup does not complete until the emulator is actually running", async () => {
+  let statusReads = 0;
+  const session = {
+    async start() {},
+    async uploadFileByLabel(label) {
+      assert.equal(label, "ROM");
+    },
+    async callDirect(command) {
+      assert.equal(command, "status");
+      statusReads += 1;
+      if (statusReads === 1) {
+        return { ok: true, romLoaded: false, paused: true, running: false, fileTransaction: { serial: 0, active: false } };
+      }
+      if (statusReads === 2) {
+        return { ok: true, romLoaded: true, paused: true, running: false, fileTransaction: { serial: 1, active: false } };
+      }
+      return { ok: true, romLoaded: true, paused: false, running: true, fileTransaction: { serial: 1, active: false } };
+    },
+    async close() {}
+  };
+  const harness = new DesmumeHarness({
+    isolationId: "lane-running",
+    config: config(),
+    sessionFactory: () => session
+  });
+  const result = await harness.loadRom();
+  assert.equal(result.running, true);
+  assert.ok(statusReads >= 3);
+});
+
+test("HarnessManager discards a failed lane and retries start_analyze with a fresh harness", async () => {
+  let created = 0;
+  let closed = 0;
+  const manager = new HarnessManager("unused.toml", {
+    configLoader: async () => ({}),
+    harnessFactory: () => {
+      created += 1;
+      const instance = created;
+      return {
+        async startAnalyze(input) {
+          assert.deepEqual(input, { statePath: "C:\\states\\retry.dst", savePath: undefined });
+          if (instance === 1) throw new Error("runtime never reached running state");
+          return { status: "ok", paused: false, running: true };
+        },
+        async close() { closed += 1; }
+      };
+    },
+    startAnalyzeMaxAttempts: 3,
+    startAnalyzeRetryDelayMs: 1
+  });
+  const result = await manager.startAnalyze("retry-lane", { statePath: "C:\\states\\retry.dst", savePath: undefined });
+  assert.deepEqual(result, { status: "ok", paused: false, running: true });
+  assert.equal(created, 2);
+  assert.equal(closed, 1);
+});
+
+test("Save start imports Save In after ROM startup and preserves the resulting run state", async () => {
+  const fake = new FakeAnalyzeSession();
+  fake.uploadFileByLabel = async function (label, filePath) {
+    this.events.push(`upload:${label}:${filePath}`);
+    if (label === "ROM") {
+      this.romLoaded = true;
+      this.fileTransactionSerial += 1;
+    }
+    if (label === "Save In") this.fileTransactionSerial += 1;
+  };
+  const harness = new DesmumeHarness({
+    isolationId: "lane-save",
+    config: config(),
+    sessionFactory: () => fake
+  });
+  const savePath = "C:\\saves\\game.sav";
+  const result = await harness.startAnalyze({ savePath });
+  assert.deepEqual(result, { status: "ok", paused: false, running: true });
+  assert.ok(fake.events.includes(`upload:Save In:${savePath}`));
+});
+
+test("ARMv5T preprocessor preserves legacy origin, label, address, and BL resolution semantics", () => {
+  const source = [
+    "entry:",
+    "BL FUN_02000120",
+    ".word 0x12345678",
+    ".addr entry",
+    ".addr4 entry",
+    "#! 0x02001000",
+    "next:",
+    "bl FUN_02000FF0",
+    ".ltorg",
+    "MOV r0, r0"
+  ].join("\n");
+  const result = preprocessAssemblySource(source, 0x02000100);
+  assert.deepEqual(result.generatedSource.split("\n"), [
+    "entry:",
+    "BL m+0x20",
+    ".word 0x12345678",
+    "\t.word 0x2000100",
+    "\t.word 0x20000fc",
+    "next:",
+    "bl m-0x10",
+    ".ltorg",
+    "MOV r0, r0"
+  ]);
+  assert.equal(result.debuggerText.split("\n").at(-1), "MOV r0, r0 => 0x2001004");
 });
 
 test("screenshot writes multiple DeSmuME PNG framebuffers under the configured directory without returning dataUrl", async () => {

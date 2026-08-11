@@ -38,7 +38,7 @@ tool_timeout_sec = 600
 tool_output_token_limit = 1000000
 ```
 ## Codexから見えるMCP tools
-- `start_analyze`: `state_path` を引数で受け、Chrome起動または既存lane再利用、ROM読込、State読込、analysis baseline作成まで行い、`status` / `paused` / `running` だけを返す。
+- `start_analyze`: `state_path` または `save_path` のどちらか一方を引数で受け、Chrome起動または既存lane再利用、ROM読込、State/Save読込、analysis baseline作成まで行い、`status` / `paused` / `running` だけを返す。ROM投入後に実際の `running=true` へ到達しない起動は失敗扱いにし、laneを破棄して500ms後に新しいChromeから最大3回まで暗黙再試行する。
 - `status`: 現在のDeSmuME状態を取得する。
 - `direct_status`: WebMCP transportを挟まずdocumented browser APIから現在のDeSmuME statusを直接取得する。
 - `analysis_context`: チャットを跨いで作業を再開するための小さい状況要約を返す。State/baseline、pause/run、frame、ARM9 PC/CPSR、最新break、起動中Persistent Scriptだけを含み、call stackやdisassemblyは含めない。
@@ -58,18 +58,21 @@ tool_output_token_limit = 1000000
 - `restore_baseline`: analysis baselineを復元する。
 - `list_pscript_mcp`: Persistent Scriptが公開したMCP一覧を取得する。
 - `call_pscript_mcp`: Persistent Script MCPを呼ぶ。
+- `inject_bytes_file`: 絶対パスのローカルファイルを最大1MiBまで読み、指定開始アドレスへそのままバイト注入する。
 - `close_instance`: isolation idに対応するChrome/DeSmuMEを閉じる。
+- `close_all_sessions`: このstdio MCPプロセスが管理している全Chrome/DeSmuME laneを閉じる。通常の`Browser.close`後も子Chromeが残っていればkill fallbackを行う。
 ## start_analyze
-新しい `isolation_id` では原則として最初に `start_analyze` を呼びます。`state_path` は必須引数です。同じ `isolation_id` で別の `state_path` を指定して再度呼んでも、stdio MCPやChromeプロセス自体は再起動せず既存laneを再利用します。処理順は以下です。
+新しい `isolation_id` では原則として最初に `start_analyze` を呼びます。`state_path` と `save_path` は排他的で、必ずどちらか一方を指定します。同じ `isolation_id` で別の入力を指定して再度呼んでも、正常なlaneならstdio MCPやChromeプロセス自体は再起動せず既存laneを再利用します。処理順は以下です。
 ```text
 start_analyze { isolation_id: "lane-a", state_path: "C:\\dq9\\states\\battle-a.dst" }
 ```
 1. isolation id 専用Chrome profileと自動割当DevTools portでChromeを起動する。
 2. Chromeを `--enable-features=WebMCPTesting,DevToolsWebMCPSupport` 付きで起動し、DeSmuMEのWebMCP登録完了を待つ。
 3. `harness.toml` のROMをfile inputへローカル投入し、file transaction完了まで待つ。
-4. 呼び出し引数 `state_path` のStateをfile inputへローカル投入し、`stateLoadSerial` 増加とfile transaction完了まで待つ。
-5. State読込直後の状態を `saveAnalysisBaseline` で保存する。baseline作成のために余計なframeは進めない。
-6. `{ status: "ok", paused, running }` だけを返す。UI snapshot、full status、`snapshotContext` は返さず、必要な場合は専用toolを別途呼ぶ。
+4. ROM投入後に `romLoaded=true` だけでなく `running=true` / `paused=false` まで待つ。Service Workerやruntime初期化失敗などでrunningへ到達しない場合、そのlaneを閉じ、500ms後に新しいChromeから開始処理全体をやり直す。
+5. `state_path` の場合はStateを `State In` へ、`save_path` の場合はSaveを `Save In` へ投入し、対応するfile transaction完了まで待つ。
+6. 読込直後の状態を `saveAnalysisBaseline` で保存する。baseline作成のために余計なframeは進めない。
+7. `{ status: "ok", paused, running }` だけを返す。UI snapshot、full status、`snapshotContext` は返さず、必要な場合は専用toolを別途呼ぶ。
 
 ## チャットを跨いで作業を再開する
 `analysis_context` は再開に必要な情報だけを小さく返します。通常はbreakpoint一覧も省略し、必要な場合だけ `include_breakpoints: true` を指定します。call stack、disassembly、script source、console全文は自動では含めません。
@@ -109,6 +112,10 @@ Chrome内部ではDeSmuMEページが登録したWebMCPを使用しますが、�
 - `screenshot` はPNG bytesを保存する必要があるため、内部のdocumented `takeScreenshot({download:false,includeDataUrl:true})` を直接使い、data URLはstdio MCPへ漏らさない。
 - Persistent Script管理、file transaction serial監視、baseline管理など、structured resultを機械判定する内部処理はDeSmuMEのdocumented browser APIを直接使う。
 WebMCP実行系が返す `status: "Completed"` のようなtransport wrapperはstdio MCPの外へ出しません。実際のDeSmuME出力だけを返します。
+## Chromeウインドウ
+Chrome起動時は最小化起動を使いません。AI操作前にはCDPのwindow stateを確認し、最小化されていれば`normal`へ戻してから操作します。`Page.bringToFront`は呼ばないため、長時間の自動操作がOSのキーボードフォーカスを継続的に奪う動作にはしません。またChromeはbackground timer/renderer/occluded-window throttlingを無効化して起動し、背面化によるエミュレータ停止を避けます。
+## ARMv5T assembly preprocessor
+`src/armv5t-assembly-preprocessor.js` は従来の `armv5tAssemblyPlayground/assembly.php` の変換規則をNode.jsへ移植したものです。`#!` origin、label、`.addr`、`.addr4`、`BL/bl FUN_xxxxxxxx`、`.ltorg` のアドレス計数規則を維持し、`preprocessAssemblySource(source, initialBaseAddress)` を公開します。`local-mcp-chatgpt-tunnel` 側のsandboxed `buildv5tassembly` MCPから、このモジュールを絶対パスで固定指定して利用できます。
 ## MCP output
 DeSmuMEのobject結果をJSON文字列へ変換してさらにJSON-RPCへ詰める二重JSONは避けます。stdio MCPの `structuredContent` には実際のobjectをそのまま置き、`content` はDeSmuME本体の `compactOutputText` と同じflatten方式の短いtextを返します。内側WebMCPがすでに `content` / `structuredContent` を返した場合も不要な再ラップをしません。
 例として `{ ok: true, paused: true, frame: 42 }` はtext側では次の形になります。
