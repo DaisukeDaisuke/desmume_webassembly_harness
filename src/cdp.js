@@ -12,6 +12,7 @@ export class CdpClient {
     this.socket = null;
     this.nextId = 1;
     this.pending = new Map();
+    this.eventListeners = new Map();
   }
 
   async connect(timeoutMs = 10000) {
@@ -43,7 +44,13 @@ export class CdpClient {
     } catch {
       return;
     }
-    if (!Object.hasOwn(message, "id")) return;
+    if (!Object.hasOwn(message, "id")) {
+      const listeners = this.eventListeners.get(message.method);
+      if (listeners) {
+        for (const listener of [...listeners]) listener(message.params ?? {});
+      }
+      return;
+    }
     const pending = this.pending.get(message.id);
     if (!pending) return;
     this.pending.delete(message.id);
@@ -80,9 +87,29 @@ export class CdpClient {
     });
   }
 
+  onEvent(method, listener) {
+    if (typeof method !== "string" || !method) throw new Error("CDP event method is required");
+    if (typeof listener !== "function") throw new Error("CDP event listener must be a function");
+    let listeners = this.eventListeners.get(method);
+    if (!listeners) {
+      listeners = new Set();
+      this.eventListeners.set(method, listeners);
+    }
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) this.eventListeners.delete(method);
+    };
+  }
+
+  isOpen() {
+    return this.socket?.readyState === WebSocket.OPEN;
+  }
+
   close() {
     if (!this.socket) return;
     this.socket.close();
     this.socket = null;
+    this.eventListeners.clear();
   }
 }

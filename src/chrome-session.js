@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, stat } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rename, rm, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -113,10 +113,14 @@ export class ChromeSession {
     this.port = null;
     this.targetId = null;
     this.startupActive = false;
+    this.downloadActive = false;
   }
 
   async start() {
-    if (this.cdp) return;
+    if (this.cdp) {
+      if (this.isAlive()) return;
+      throw new Error(`Chrome/DeSmuME session ${this.isolationId} is no longer alive`);
+    }
     this.startupActive = true;
     await mkdir(this.profileDir, { recursive: true });
     const chromePath = await findChrome(this.config.chromePath);
@@ -172,13 +176,27 @@ export class ChromeSession {
         if (!modelContext || typeof modelContext.getTools !== "function" || typeof modelContext.executeTool !== "function") return false;
         const tools = await modelContext.getTools();
         const names = new Set(tools.map((tool) => tool.name));
-        return names.has("desmume.call") && names.has("desmume.eval") && names.has("desmume.runScript");
+        return names.has("desmume.list") && names.has("desmume.call") && names.has("desmume.eval") && names.has("desmume.runScript");
       },
       [],
       this.config.startupTimeoutMs,
       "DeSmuME WebMCP tools"
     );
     this.startupActive = false;
+  }
+
+  isAlive() {
+    return this.chrome?.exitCode === null && this.cdp?.isOpen() === true;
+  }
+
+  describe() {
+    return {
+      isolationId: this.isolationId,
+      started: this.chrome !== null || this.cdp !== null,
+      alive: this.isAlive(),
+      dead: (this.chrome !== null || this.cdp !== null) && !this.isAlive(),
+      headless: this.config.headless
+    };
   }
 
   async ensureWindowUsable() {
@@ -229,6 +247,15 @@ export class ChromeSession {
     return remote.value;
   }
 
+  async listCommandsDirect(timeoutMs = this.config.commandTimeoutMs) {
+    const remote = await this.#callGlobal(
+      "function() { return this.DesmumeMCP.list(); }",
+      [],
+      { returnByValue: true, timeoutMs }
+    );
+    return remote.value;
+  }
+
   async callWebMcp(toolName, input = {}, timeoutMs = this.config.commandTimeoutMs) {
     const remote = await this.#callGlobal(
       `async function(toolName, input) {
@@ -247,6 +274,67 @@ export class ChromeSession {
       { returnByValue: true, timeoutMs }
     );
     return normalizeWebMcpExecution(toolName, remote.value ?? null);
+  }
+
+  async downloadCommandToFile(command, params, destinationPath, timeoutMs = this.config.fileTimeoutMs) {
+    await this.start();
+    if (this.downloadActive) throw new Error("Another managed Chrome download is already active for this emulator instance");
+    this.downloadActive = true;
+    const absoluteDestination = path.resolve(destinationPath);
+    const destinationDirectory = path.dirname(absoluteDestination);
+    await mkdir(destinationDirectory, { recursive: true });
+    if (await fileExists(absoluteDestination)) {
+      this.downloadActive = false;
+      throw new Error(`Export destination already exists: ${absoluteDestination}`);
+    }
+    const temporaryDirectory = await mkdtemp(path.join(destinationDirectory, ".desmume-export-"));
+    const expectedFilename = command === "exportStateFile"
+      ? "desmume-state.dst"
+      : command === "exportSaveFile" ? "desmume-save.sav" : null;
+    let downloadGuid = null;
+    let suggestedFilename = null;
+    let timeout = null;
+    let removeBeginListener = () => {};
+    let removeProgressListener = () => {};
+    try {
+      const completed = new Promise((resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${command} download did not complete within ${timeoutMs} ms`)), timeoutMs);
+        removeBeginListener = this.cdp.onEvent("Browser.downloadWillBegin", (event) => {
+          if (expectedFilename && String(event.suggestedFilename ?? "") !== expectedFilename) return;
+          if (downloadGuid !== null) return;
+          downloadGuid = String(event.guid ?? "");
+          suggestedFilename = String(event.suggestedFilename ?? "");
+          if (!downloadGuid || !suggestedFilename) reject(new Error(`${command} download metadata was incomplete`));
+        });
+        removeProgressListener = this.cdp.onEvent("Browser.downloadProgress", (event) => {
+          if (!downloadGuid || String(event.guid ?? "") !== downloadGuid) return;
+          if (event.state === "completed") resolve();
+          else if (event.state === "canceled") reject(new Error(`${command} download was canceled`));
+        });
+      });
+      await this.cdp.send("Browser.setDownloadBehavior", {
+        behavior: "allow",
+        downloadPath: temporaryDirectory,
+        eventsEnabled: true
+      }, timeoutMs);
+      const result = await this.callDirect(command, params, timeoutMs);
+      if (result?.ok === false) {
+        throw new Error(`${command}: ${result.error?.message ?? "application error"}`);
+      }
+      await completed;
+      const downloadedPath = path.join(temporaryDirectory, suggestedFilename);
+      const info = await stat(downloadedPath);
+      if (!info.isFile()) throw new Error(`${command} download did not produce a regular file`);
+      await rename(downloadedPath, absoluteDestination);
+      return { result, path: absoluteDestination, bytes: info.size };
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      removeBeginListener();
+      removeProgressListener();
+      await this.cdp?.send("Browser.setDownloadBehavior", { behavior: "default", eventsEnabled: false }, 2000).catch(() => {});
+      await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
+      this.downloadActive = false;
+    }
   }
 
   async snapshotElements() {
@@ -327,6 +415,7 @@ export class ChromeSession {
     this.cdp = null;
     this.targetId = null;
     this.startupActive = false;
+    this.downloadActive = false;
     if (cdp) {
       try {
         await cdp.send("Browser.close", {}, 2000);

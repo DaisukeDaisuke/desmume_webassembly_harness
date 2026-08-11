@@ -1,4 +1,5 @@
 .harness/
 harness/screenshots/
+harness/exports/
 harness.toml
 /.idea

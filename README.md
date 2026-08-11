@@ -11,6 +11,7 @@
 ```toml
 rom_path = 'C:\dq9\rom.nds'
 screenshot_path = 'harness/screenshots'
+export_path = 'harness/exports'
 baseline_name = 'battle-start'
 ```
 `harness.toml` と Chrome の分離プロファイル `.harness/` は Git 対象外です。
@@ -38,10 +39,17 @@ tool_timeout_sec = 600
 tool_output_token_limit = 1000000
 ```
 ## Codexから見えるMCP tools
-- `start_analyze`: `state_path` または `save_path` のどちらか一方を引数で受け、Chrome起動または既存lane再利用、ROM読込、State/Save読込、analysis baseline作成まで行い、`status` / `paused` / `running` だけを返す。ROM投入後に実際の `running=true` へ到達しない起動は失敗扱いにし、laneを破棄して500ms後に新しいChromeから最大3回まで暗黙再試行する。
+- `start_analyze`: 新しいlane専用。`state_path` または `save_path` のどちらか一方を受け、Chrome起動、ROM読込、State/Save読込、analysis baseline作成まで行う。既存laneには使用せず`restart_analyze`を使う。初回起動失敗だけはfresh Chromeから最大3回まで再試行する。
+- `restart_analyze`: 既存laneのChromeウインドウを使い回し、State/Saveを差し替えてanalysis baselineを作り直す。`isolation_id`省略は既存laneが1個だけの場合に限る。閉じられた／クラッシュしたChromeは復活させない。
+- `list_instances`: 現在MCPプロセスが保持しているlaneとalive/dead状態を最大64件返す。Chromeを新規作成しない。
+- `list_commands`: 実行中ページの`DesmumeMCP.list()`を読む。既定は名前だけ64件、最大64件でページングし、description要求時も各160文字までに制限して巨大なAPI一覧を一度に返さない。
+- `load_state_file`: 既存laneへローカルStateを投入する。新しいChromeは作らない。
+- `load_save_file`: 既存laneへローカルSaveを投入する。新しいChromeは作らない。
+- `export_state_file`: 現在Stateを`export_path`へ保存する。State本文はMCP出力へ返さない。
+- `export_save_file`: 現在Saveを`export_path`へ保存する。Save本文はMCP出力へ返さない。
 - `status`: 現在のDeSmuME状態を取得する。
 - `direct_status`: WebMCP transportを挟まずdocumented browser APIから現在のDeSmuME statusを直接取得する。
-- `analysis_context`: チャットを跨いで作業を再開するための小さい状況要約を返す。State/baseline、pause/run、frame、ARM9 PC/CPSR、最新break、起動中Persistent Scriptだけを含み、call stackやdisassemblyは含めない。
+- `analysis_context`: チャットを跨いで作業を再開するため、ブラウザ／エミュレータからその場で取得した小さい状況要約を返す。Harness内部のState pathやscript source pathには依存せず、配列も上限付きにする。
 - `pause`: エミュレータを停止する。
 - `resume`: エミュレータを再開する。
 - `call`: 任意のDeSmuME commandを呼ぶ。
@@ -61,8 +69,11 @@ tool_output_token_limit = 1000000
 - `inject_bytes_file`: 絶対パスのローカルファイルを最大1MiBまで読み、指定開始アドレスへそのままバイト注入する。
 - `close_instance`: isolation idに対応するChrome/DeSmuMEを閉じる。
 - `close_all_sessions`: このstdio MCPプロセスが管理している全Chrome/DeSmuME laneを閉じる。通常の`Browser.close`後も子Chromeが残っていればkill fallbackを行う。
+`start_analyze`だけが新しいChrome laneを作成します。`status`、`call`、`analysis_context`、script操作、screenshotなど他のtoolへ存在しない`isolation_id`を渡してもChromeは作られずエラーになります。
+同じ`isolation_id`の`start_analyze`がすでに進行中の場合も、二重起動せず直ちにエラーにします。
+`start_analyze`以外は`isolation_id`を省略したとき既存laneが1個ならそれを使い、複数laneがある場合は明示指定を要求します。
 ## start_analyze
-新しい `isolation_id` では原則として最初に `start_analyze` を呼びます。`state_path` と `save_path` は排他的で、必ずどちらか一方を指定します。同じ `isolation_id` で別の入力を指定して再度呼んでも、正常なlaneならstdio MCPやChromeプロセス自体は再起動せず既存laneを再利用します。処理順は以下です。
+新しい `isolation_id` では最初に `start_analyze` を呼びます。`state_path` と `save_path` は排他的で、必ずどちらか一方を指定します。既存laneの再利用は`restart_analyze`で行い、`start_analyze`へ既存`isolation_id`を渡すとエラーにします。
 ```text
 start_analyze { isolation_id: "lane-a", state_path: "C:\\dq9\\states\\battle-a.dst" }
 ```
@@ -74,10 +85,12 @@ start_analyze { isolation_id: "lane-a", state_path: "C:\\dq9\\states\\battle-a.d
 6. 読込直後の状態を `saveAnalysisBaseline` で保存する。baseline作成のために余計なframeは進めない。
 7. `{ status: "ok", paused, running }` だけを返す。UI snapshot、full status、`snapshotContext` は返さず、必要な場合は専用toolを別途呼ぶ。
 
-## チャットを跨いで作業を再開する
-`analysis_context` は再開に必要な情報だけを小さく返します。通常はbreakpoint一覧も省略し、必要な場合だけ `include_breakpoints: true` を指定します。call stack、disassembly、script source、console全文は自動では含めません。
+既存laneを別State/Saveからやり直す場合は、まず`list_instances`でlaneを確認して`restart_analyze`を呼びます。既存laneが1個だけなら`isolation_id`は省略できます。ユーザーがChromeを閉じた、またはChromeがクラッシュしたlaneはdeadとして扱い、自動的に新しいChromeへ差し替えません。
 
-返す主な情報は `stateName` / `statePath` / `baselineName` / `baselinePresent` / `paused` / `running` / `frame` / ARM9 `pc` / `cpsr` / 最新 `break` / 起動中 `scripts` です。Harness経由で起動したPersistent Scriptには把握できる場合 `sourcePath` も付きます。
+## チャットを跨いで作業を再開する
+`analysis_context` は再開に必要な情報だけをブラウザAPIから毎回取得して小さく返します。通常はbreakpoint一覧も省略し、必要な場合だけ `include_breakpoints: true` を指定します。call stack、disassembly、script source、ローカルState path、console全文は自動では含めません。baselineとrunning scriptは各16件、明示要求したbreakpointも128件までです。
+
+返す主な情報はROM load状態、`paused` / `running` / `frame`、現在CPUと主要register、trace/IRQ方針、最新`break`、ブラウザ側recent file一覧、analysis baseline一覧、起動中Persistent Scriptです。Harnessが過去に覚えたpathを正本にはしません。
 
 `direct_status` はDeSmuMEのdocumented `status` commandをbrowser API bridgeから直接呼びます。WebMCP transport wrapperを経由した `status` が不要な内部・機械処理向けです。
 
@@ -104,6 +117,9 @@ screenshot_path = 'harness/screenshots/lane-b'
 `screenshot` はブラウザやChromeウインドウのキャプチャではなく、DeSmuME本体の `takeScreenshot` が `ui.screen.toDataURL()` で生成する256x384のDSキャンバスPNGだけを保存します。`screenshot_path` は保存ディレクトリで、デフォルトはCodex sandboxから参照しやすい `harness/screenshots` です。呼び出し時に `name` を省略すると `frame-000001.png`, `frame-000002.png`, ... とlaneごとに自動採番し、`name: "battle-start"` のように指定すると `battle-start.png` として保存します。PNG本体のdata URLはMCP出力へ返しません。MCPの返り値 `path` は保存したPNGの絶対パスです。
 
 State読込直後はAPI_CURRENTの仕様上、1つのcomplete emulator frameが進むまで画面capture APIが `SCREEN_INVALID` になります。`start_analyze` は読み込んだStateを厳密に保つため勝手に1フレーム進めません。そのため必要なタイミングでフレームを進めた後に `screenshot` を呼びます。
+
+## State / Save export
+`export_state_file`と`export_save_file`はブラウザAPIの通常のdownloadをCDPで専用一時ディレクトリへ受け、完了後に`harness.toml`の`export_path`へ移します。本文byte列やdata URLはstdio MCPへ返さず、`path`と`bytes`だけを返します。`name`を省略すると`state-000001.dst`または`save-000001.sav`のようにlaneごとに採番します。
 ## WebMCP transport
 Chrome内部ではDeSmuMEページが登録したWebMCPを使用しますが、生の `desmume.call`、`desmume.eval`、`desmume.runScript` tool objectをCodex側へ再公開しません。stdio MCP側では用途別のtoolとして隠蔽します。
 - `call` / `pause` / `resume` / `status` は内部で `desmume.call` を使う。
@@ -127,7 +143,7 @@ frame=42
 ## Persistent Scripts
 `rerun_pscript` は固定UIDや `Run / Update` のclickを使用しません。
 1. 明示 `name` と同名のrunning scriptがあれば `listScripts` からidを解決して `stopScript` する。
-2. 最新ページ状態から `Load source` file inputを解決してローカルUTF-8 sourceを投入する。
+2. `Load source` file inputを現在DOMから直接解決してローカルUTF-8 sourceを投入する。UI snapshotは取得も返却もしない。
 3. editorへsourceが反映されたことを確認する。
 4. `runLoadedPersistentScript` を直接呼ぶ。
 `wait_for_registration=false` ならAPI_CURRENTの `started:true` 時点で返し、registration完了を待ちません。`startup_timeout_ms` はWorker/parser/compile/started handshakeだけに適用され、script bodyのtimeoutにはしません。

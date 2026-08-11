@@ -23,15 +23,50 @@ function selectorParams(selector) {
   throw new Error("Script selector must be a positive numeric id or a non-empty name");
 }
 
+function analysisInput(input, operation) {
+  const statePath = typeof input === "string" ? input : input?.statePath;
+  const savePath = typeof input === "object" && input !== null ? input.savePath : undefined;
+  if ((statePath === undefined) === (savePath === undefined)) {
+    throw new Error(`${operation} requires exactly one of statePath or savePath`);
+  }
+  return { statePath, savePath };
+}
+
+function compactRunState(status) {
+  return {
+    ok: status?.ok !== false,
+    romLoaded: status?.romLoaded === true,
+    paused: status?.paused === true,
+    running: status?.running === true,
+    frame: Number(status?.frame ?? 0),
+    stateLoadSerial: Number(status?.stateLoadSerial ?? 0),
+    fileTransactionSerial: Number(status?.fileTransaction?.serial ?? 0)
+  };
+}
+
+function managedFileName(name, extension, fallback) {
+  if (name !== undefined && typeof name !== "string") throw new Error("export name must be a string");
+  let fileName = name === undefined ? fallback : name.trim();
+  if (!fileName) throw new Error("export name must be a non-empty string");
+  if (fileName.includes("/") || fileName.includes("\\") || fileName === "." || fileName === "..") {
+    throw new Error("export name must be a file name, not a path");
+  }
+  if (!fileName.toLowerCase().endsWith(extension)) fileName += extension;
+  if (fileName.length > 255) throw new Error("export name must be at most 255 characters including extension");
+  return fileName;
+}
+
 export class DesmumeHarness {
   constructor({ isolationId = "default", config, sessionFactory = (options) => new ChromeSession(options) }) {
     this.isolationId = isolationId;
     this.config = config;
     this.session = sessionFactory({ isolationId, config });
     this.screenshotSerial = 0;
-    this.currentStatePath = null;
-    this.currentBaselineName = config.baselineName;
-    this.scriptSourcePaths = new Map();
+    this.exportSerial = { state: 0, save: 0 };
+  }
+
+  describe() {
+    return this.session.describe();
   }
 
   async start() {
@@ -103,14 +138,11 @@ export class DesmumeHarness {
     if (typeof filePath !== "string" || !filePath.trim()) throw new Error("state_path is required");
     const before = requireOk(await this.#directCall("status"), "status before State load");
     const previousSerial = Number(before.stateLoadSerial ?? 0);
-    const absolute = path.resolve(filePath);
     await this.session.uploadFileByLabel("State In", filePath);
-    const loaded = await this.#waitForStatus(
+    return await this.#waitForStatus(
       (status) => Number(status.stateLoadSerial ?? 0) > previousSerial && status.fileTransaction?.active === false,
       "State load"
     );
-    this.currentStatePath = absolute;
-    return loaded;
   }
 
   async loadSave(filePath) {
@@ -118,36 +150,33 @@ export class DesmumeHarness {
     if (typeof filePath !== "string" || !filePath.trim()) throw new Error("save_path is required");
     const before = requireOk(await this.#directCall("status"), "status before Save load");
     const previousTransactionSerial = Number(before.fileTransaction?.serial ?? 0);
-    const absolute = path.resolve(filePath);
     await this.session.uploadFileByLabel("Save In", filePath);
-    const loaded = await this.#waitForStatus(
+    return await this.#waitForStatus(
       (status) => status.romLoaded === true
         && Number(status.fileTransaction?.serial ?? 0) > previousTransactionSerial
         && status.fileTransaction?.active === false,
       "Save load"
     );
-    this.currentStatePath = null;
-    return loaded;
+  }
+
+  async loadStateFile(filePath) {
+    return compactRunState(await this.loadState(filePath));
+  }
+
+  async loadSaveFile(filePath) {
+    return compactRunState(await this.loadSave(filePath));
   }
 
   async saveBaseline(name = this.config.baselineName, replace = this.config.replaceBaseline) {
-    const saved = requireOk(await this.#directCall("saveAnalysisBaseline", { name, replace }), "saveAnalysisBaseline");
-    this.currentBaselineName = name;
-    return saved;
+    return requireOk(await this.#directCall("saveAnalysisBaseline", { name, replace }), "saveAnalysisBaseline");
   }
 
   async restoreBaseline(name = this.config.baselineName) {
-    const restored = requireOk(await this.#directCall("restoreAnalysisBaseline", { name }), "restoreAnalysisBaseline");
-    this.currentBaselineName = name;
-    return restored;
+    return requireOk(await this.#directCall("restoreAnalysisBaseline", { name }), "restoreAnalysisBaseline");
   }
 
   async startAnalyze(input) {
-    const statePath = typeof input === "string" ? input : input?.statePath;
-    const savePath = typeof input === "object" && input !== null ? input.savePath : undefined;
-    if ((statePath === undefined) === (savePath === undefined)) {
-      throw new Error("startAnalyze requires exactly one of statePath or savePath");
-    }
+    const { statePath, savePath } = analysisInput(input, "startAnalyze");
     await this.start();
     await this.loadRom();
     const stateStatus = statePath !== undefined
@@ -158,6 +187,59 @@ export class DesmumeHarness {
       status: "ok",
       paused: stateStatus.paused,
       running: stateStatus.running
+    };
+  }
+
+  async restartAnalyze(input) {
+    const { statePath, savePath } = analysisInput(input, "restartAnalyze");
+    await this.start();
+    const before = await this.directStatus();
+    if (!before.romLoaded) await this.loadRom();
+    const stateStatus = statePath !== undefined
+      ? await this.loadState(statePath)
+      : await this.loadSave(savePath);
+    await this.saveBaseline();
+    return {
+      status: "ok",
+      reusedWindow: true,
+      paused: stateStatus.paused,
+      running: stateStatus.running
+    };
+  }
+
+  async listCommands({ filter = "", offset = 0, limit = 64, includeDescriptions = false } = {}) {
+    await this.start();
+    const inventory = await this.session.listCommandsDirect();
+    if (!inventory || typeof inventory !== "object" || Array.isArray(inventory)) {
+      throw new Error("DesmumeMCP.list() did not return a command inventory object");
+    }
+    if (typeof filter !== "string") throw new Error("filter must be a string");
+    if (filter.length > 128) throw new Error("filter must be at most 128 characters");
+    if (typeof includeDescriptions !== "boolean") throw new Error("includeDescriptions must be boolean");
+    const query = filter.trim().toLowerCase();
+    const safeOffset = Number(offset);
+    const safeLimit = Number(limit);
+    if (!Number.isSafeInteger(safeOffset) || safeOffset < 0) throw new Error("offset must be a non-negative integer");
+    if (!Number.isSafeInteger(safeLimit) || safeLimit < 1 || safeLimit > 64) throw new Error("limit must be an integer from 1 through 64");
+    const warning = typeof inventory.warning === "string" ? inventory.warning.slice(0, 240) : null;
+    const entries = Object.entries(inventory)
+      .filter(([name]) => name !== "warning")
+      .filter(([name, description]) => !query
+        || name.toLowerCase().includes(query)
+        || String(description ?? "").toLowerCase().includes(query))
+      .sort(([a], [b]) => a.localeCompare(b));
+    const selected = entries.slice(safeOffset, safeOffset + safeLimit);
+    const nextOffset = safeOffset + selected.length < entries.length ? safeOffset + selected.length : null;
+    return {
+      complete: warning === null,
+      total: entries.length,
+      offset: safeOffset,
+      returned: selected.length,
+      nextOffset,
+      ...(warning ? { warning } : {}),
+      commands: includeDescriptions
+        ? selected.map(([name, description]) => ({ name, description: String(description ?? "").slice(0, 160) }))
+        : selected.map(([name]) => name)
     };
   }
 
@@ -211,6 +293,33 @@ export class DesmumeHarness {
     return { ...metadata, path: outputPath, bytes: bytes.length };
   }
 
+  async #exportFile(kind, name) {
+    const outputDirectory = this.config.exportPath;
+    if (!outputDirectory) throw new Error("export_path is not configured");
+    const isState = kind === "state";
+    const extension = isState ? ".dst" : ".sav";
+    const command = isState ? "exportStateFile" : "exportSaveFile";
+    this.exportSerial[kind] += 1;
+    const fallback = `${kind}-${String(this.exportSerial[kind]).padStart(6, "0")}${extension}`;
+    const fileName = managedFileName(name, extension, fallback);
+    const outputPath = path.join(outputDirectory, fileName);
+    const exported = await this.session.downloadCommandToFile(command, {}, outputPath, this.config.fileTimeoutMs);
+    return {
+      ok: true,
+      kind,
+      path: exported.path,
+      bytes: exported.bytes
+    };
+  }
+
+  async exportStateFile(name) {
+    return await this.#exportFile("state", name);
+  }
+
+  async exportSaveFile(name) {
+    return await this.#exportFile("save", name);
+  }
+
   async eval(script, timeoutMs = this.config.commandTimeoutMs) {
     if (typeof script !== "string") throw new Error("eval script must be a string");
     await this.start();
@@ -260,7 +369,6 @@ export class DesmumeHarness {
       const existing = listed.scripts?.find((candidate) => candidate.name === name);
       if (existing) stopped = requireOk(await this.#directCall("stopScript", { id: existing.id }), "stopScript before rerunPScript");
     }
-    const snapshot = await this.snapshotElements();
     await this.session.uploadFileByLabel("Load source", absolute);
     await this.session.waitForScriptEditorSource(source, this.config.fileTimeoutMs);
     const params = {
@@ -273,8 +381,7 @@ export class DesmumeHarness {
       await this.#directCall("runLoadedPersistentScript", params, timeoutMs),
       "runLoadedPersistentScript"
     );
-    if (Number.isSafeInteger(script.id)) this.scriptSourcePaths.set(script.id, absolute);
-    return { ok: true, stopped, script, snapshot };
+    return { ok: true, stopped, script };
   }
 
   async rerunPScriptConsole(filePath, asyncMode = false, name, {
@@ -293,7 +400,6 @@ export class DesmumeHarness {
       "runPersistentScript"
     );
     const id = script?.id;
-    if (Number.isSafeInteger(id)) this.scriptSourcePaths.set(id, absolute);
     const printed = requireOk(await this.#directCall("listScriptPrint", {
       ...(Number.isSafeInteger(id) ? { id } : {}),
       max
@@ -320,8 +426,8 @@ export class DesmumeHarness {
     const scriptList = await this.#directCall("listScripts");
     const breakKinds = ["exec", "read", "write", "dataAbort", "prefetchAbort", "undefinedInstruction"];
     const lastBreak = status.native?.lastBreak?.hit ? status.native.lastBreak : null;
-    const latestState = status.recentFiles?.find((entry) => entry?.kind === "state") ?? null;
-    const scripts = (scriptList?.scripts ?? []).filter((script) => script.running === true).map((script) => ({
+    const scriptsSource = (scriptList?.scripts ?? []).filter((script) => script.running === true);
+    const scripts = scriptsSource.slice(0, 16).map((script) => ({
       id: script.id,
       name: script.name,
       running: script.running,
@@ -329,21 +435,32 @@ export class DesmumeHarness {
       registrationComplete: script.registrationComplete,
       identitySource: script.identitySource,
       asyncMode: script.asyncMode,
-      mcpCount: script.mcpCount,
-      ...(this.scriptSourcePaths.has(script.id) ? { sourcePath: this.scriptSourcePaths.get(script.id) } : {})
+      mcpCount: script.mcpCount
+    }));
+    const baselinesSource = Array.isArray(baselineList?.baselines) ? baselineList.baselines : [];
+    const baselines = baselinesSource.slice(0, 16).map((baseline) => ({
+      name: baseline.name,
+      savedAt: baseline.savedAt ?? null,
+      romName: baseline.romName ?? "",
+      stateSize: Number(baseline.stateSize ?? 0),
+      pcVerified: baseline.pcVerified === true
     }));
     const result = {
       isolationId: this.isolationId,
-      stateName: this.currentStatePath ? path.basename(this.currentStatePath) : latestState?.name ?? null,
-      statePath: this.currentStatePath,
-      baselineName: this.currentBaselineName,
-      baselinePresent: (baselineList?.baselines ?? []).some((baseline) => baseline.name === this.currentBaselineName),
+      romLoaded: status.romLoaded === true,
+      romSize: Number(status.romSize ?? 0),
       paused: status.paused,
       running: status.running,
       frame: status.frame,
-      pc: status.native?.arm9?.pc,
-      cpsr: status.native?.arm9?.cpsr,
-      traceEnabled: status.native?.traceEnabled,
+      stateLoadSerial: Number(status.stateLoadSerial ?? 0),
+      fileTransaction: {
+        active: status.fileTransaction?.active === true,
+        serial: Number(status.fileTransaction?.serial ?? 0),
+        reason: String(status.fileTransaction?.reason ?? "").slice(0, 120)
+      },
+      cpu: snapshot?.cpu ?? status.cpu ?? "arm9",
+      registers: snapshot?.registers ?? null,
+      traceEnabled: snapshot?.traceEnabled ?? status.native?.traceEnabled,
       skipIrq: snapshot?.skipIrq,
       ...(lastBreak ? {
         break: {
@@ -353,9 +470,32 @@ export class DesmumeHarness {
           pc: Number(lastBreak.pc) >>> 0
         }
       } : { break: null }),
-      scripts
+      recentFiles: (status.recentFiles ?? []).slice(0, 6).map((entry) => ({
+        id: entry.id,
+        kind: entry.kind,
+        name: entry.name,
+        slot: entry.slot ?? "",
+        size: Number(entry.size ?? entry.bytes ?? 0)
+      })),
+      baselines,
+      baselinesTruncated: baselinesSource.length > baselines.length,
+      scripts,
+      scriptsTruncated: scriptsSource.length > scripts.length
     };
-    if (includeBreakpoints) result.breakpoints = await this.#directCall("listBreakpoints");
+    if (includeBreakpoints) {
+      const breakpointResult = await this.#directCall("listBreakpoints");
+      const breakpointSource = Array.isArray(breakpointResult)
+        ? breakpointResult
+        : Array.isArray(breakpointResult?.breakpoints) ? breakpointResult.breakpoints : [];
+      result.breakpoints = breakpointSource.slice(0, 128).map((breakpoint) => ({
+        id: breakpoint.id,
+        cpu: breakpoint.cpu,
+        type: breakpoint.type,
+        address: breakpoint.address,
+        enabled: breakpoint.enabled
+      }));
+      result.breakpointsTruncated = breakpointSource.length > result.breakpoints.length;
+    }
     return result;
   }
 

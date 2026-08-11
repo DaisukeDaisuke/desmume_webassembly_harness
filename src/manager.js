@@ -15,6 +15,7 @@ export class HarnessManager {
   } = {}) {
     this.configPath = path.resolve(configPath);
     this.instances = new Map();
+    this.starting = new Set();
     this.configLoader = configLoader;
     this.harnessFactory = harnessFactory;
     this.startAnalyzeMaxAttempts = startAnalyzeMaxAttempts;
@@ -30,19 +31,59 @@ export class HarnessManager {
     return harness;
   }
 
-  async startAnalyze(isolationId = "default", input) {
-    let lastError = null;
-    for (let attempt = 1; attempt <= this.startAnalyzeMaxAttempts; attempt += 1) {
-      try {
-        return await (await this.create(isolationId)).startAnalyze(input);
-      } catch (error) {
-        lastError = error;
-        await this.close(isolationId).catch(() => {});
-        if (attempt >= this.startAnalyzeMaxAttempts) break;
-        await sleep(this.startAnalyzeRetryDelayMs);
-      }
+  requireExisting(isolationId) {
+    if (isolationId !== undefined) {
+      const harness = this.instances.get(isolationId);
+      if (!harness) throw new Error(`No existing emulator instance for isolation_id ${isolationId}; call start_analyze first`);
+      return harness;
     }
-    throw new Error(`start_analyze failed after ${this.startAnalyzeMaxAttempts} fresh Chrome attempts: ${lastError?.message ?? lastError}`);
+    if (this.instances.size === 1) return this.instances.values().next().value;
+    if (this.instances.size === 0) throw new Error("No existing emulator instances; call start_analyze first");
+    const ids = [...this.instances.keys()].slice(0, 16).join(", ");
+    throw new Error(`Multiple emulator instances exist; specify isolation_id. Existing ids: ${ids}`);
+  }
+
+  async startAnalyze(isolationId = "default", input) {
+    if (this.instances.has(isolationId)) {
+      throw new Error(`Emulator instance ${isolationId} already exists; use restart_analyze to reuse its Chrome window`);
+    }
+    if (this.starting.has(isolationId)) {
+      throw new Error(`Emulator instance ${isolationId} is already starting; do not start a second Chrome window`);
+    }
+    this.starting.add(isolationId);
+    try {
+      let lastError = null;
+      for (let attempt = 1; attempt <= this.startAnalyzeMaxAttempts; attempt += 1) {
+        try {
+          return await (await this.create(isolationId)).startAnalyze(input);
+        } catch (error) {
+          lastError = error;
+          await this.close(isolationId).catch(() => {});
+          if (attempt >= this.startAnalyzeMaxAttempts) break;
+          await sleep(this.startAnalyzeRetryDelayMs);
+        }
+      }
+      throw new Error(`start_analyze failed after ${this.startAnalyzeMaxAttempts} fresh Chrome attempts: ${lastError?.message ?? lastError}`);
+    } finally {
+      this.starting.delete(isolationId);
+    }
+  }
+
+  async restartAnalyze(isolationId, input) {
+    return await this.requireExisting(isolationId).restartAnalyze(input);
+  }
+
+  listInstances() {
+    const instances = [...this.instances.values()]
+      .map((harness) => harness.describe())
+      .sort((a, b) => a.isolationId.localeCompare(b.isolationId));
+    const selected = instances.slice(0, 64);
+    return {
+      total: instances.length,
+      returned: selected.length,
+      truncated: instances.length > selected.length,
+      instances: selected
+    };
   }
 
   async close(isolationId) {

@@ -23,7 +23,7 @@ test("stdio MCP tool results expose compact text plus one structured object with
     }
   };
   const manager = {
-    async create(id) {
+    requireExisting(id) {
       assert.equal(id, "lane-a");
       return harness;
     },
@@ -47,7 +47,7 @@ test("stdio MCP tool results expose compact text plus one structured object with
   assert.equal(reply.result.isError, false);
 });
 
-test("start_analyze forwards caller-supplied State and Save starts on the same lane", async () => {
+test("start_analyze forwards caller-supplied State and Save inputs to new lanes", async () => {
   const starts = [];
   const manager = {
     async startAnalyze(isolationId, input) {
@@ -71,12 +71,116 @@ test("start_analyze forwards caller-supplied State and Save starts on the same l
     jsonrpc: "2.0",
     id: 12,
     method: "tools/call",
-    params: { name: "start_analyze", arguments: { isolation_id: "lane-a", save_path: "C:\\saves\\a.sav" } }
+    params: { name: "start_analyze", arguments: { isolation_id: "lane-b", save_path: "C:\\saves\\a.sav" } }
   });
   assert.equal(saveReply.result.structuredContent.savePath, "C:\\saves\\a.sav");
   assert.deepEqual(starts, [
     { isolationId: "lane-a", input: { statePath: "C:\\states\\a.dst", savePath: undefined } },
-    { isolationId: "lane-a", input: { statePath: undefined, savePath: "C:\\saves\\a.sav" } }
+    { isolationId: "lane-b", input: { statePath: undefined, savePath: "C:\\saves\\a.sav" } }
+  ]);
+});
+
+test("existing-lane tools route through requireExisting and do not create a new lane", async () => {
+  const calls = [];
+  const harness = {
+    async listCommands(options) {
+      calls.push({ listCommands: options });
+      return { complete: true, total: 1, returned: 1, nextOffset: null, commands: ["status"] };
+    },
+    async loadStateFile(filePath) {
+      calls.push({ loadStateFile: filePath });
+      return { ok: true, paused: true, running: false };
+    },
+    async loadSaveFile(filePath) {
+      calls.push({ loadSaveFile: filePath });
+      return { ok: true, paused: false, running: true };
+    },
+    async exportStateFile(name) {
+      calls.push({ exportStateFile: name });
+      return { ok: true, kind: "state", path: "C:\\exports\\state.dst", bytes: 4096 };
+    },
+    async exportSaveFile(name) {
+      calls.push({ exportSaveFile: name });
+      return { ok: true, kind: "save", path: "C:\\exports\\save.sav", bytes: 512 };
+    }
+  };
+  const manager = {
+    requireExisting(id) {
+      calls.push({ requireExisting: id });
+      return harness;
+    },
+    async restartAnalyze(id, input) {
+      calls.push({ restartAnalyze: { id, input } });
+      return { status: "ok", reusedWindow: true, paused: true, running: false };
+    },
+    listInstances() {
+      calls.push("listInstances");
+      return { total: 1, returned: 1, truncated: false, instances: [{ isolationId: "lane-a", alive: true }] };
+    },
+    async create() {
+      throw new Error("create must not be called by existing-lane tools");
+    },
+    async closeAll() {}
+  };
+  const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
+  const restarted = await server.handle({
+    jsonrpc: "2.0",
+    id: 31,
+    method: "tools/call",
+    params: { name: "restart_analyze", arguments: { state_path: "C:\\states\\next.dst" } }
+  });
+  assert.equal(restarted.result.structuredContent.reusedWindow, true);
+  const listed = await server.handle({
+    jsonrpc: "2.0",
+    id: 32,
+    method: "tools/call",
+    params: { name: "list_instances", arguments: {} }
+  });
+  assert.equal(listed.result.structuredContent.instances[0].isolationId, "lane-a");
+  const commands = await server.handle({
+    jsonrpc: "2.0",
+    id: 33,
+    method: "tools/call",
+    params: { name: "list_commands", arguments: { isolation_id: "lane-a", limit: 8 } }
+  });
+  assert.deepEqual(commands.result.structuredContent.commands, ["status"]);
+  await server.handle({
+    jsonrpc: "2.0",
+    id: 34,
+    method: "tools/call",
+    params: { name: "load_state_file", arguments: { isolation_id: "lane-a", path: "C:\\states\\a.dst" } }
+  });
+  await server.handle({
+    jsonrpc: "2.0",
+    id: 35,
+    method: "tools/call",
+    params: { name: "load_save_file", arguments: { isolation_id: "lane-a", path: "C:\\saves\\a.sav" } }
+  });
+  await server.handle({
+    jsonrpc: "2.0",
+    id: 36,
+    method: "tools/call",
+    params: { name: "export_state_file", arguments: { isolation_id: "lane-a", name: "state" } }
+  });
+  await server.handle({
+    jsonrpc: "2.0",
+    id: 37,
+    method: "tools/call",
+    params: { name: "export_save_file", arguments: { isolation_id: "lane-a", name: "save" } }
+  });
+  assert.deepEqual(calls, [
+    { restartAnalyze: { id: undefined, input: { statePath: "C:\\states\\next.dst", savePath: undefined } } },
+    "listInstances",
+    { requireExisting: "lane-a" },
+    { listCommands: { filter: "", offset: 0, limit: 8, includeDescriptions: false } },
+    { requireExisting: "lane-a" },
+    { loadStateFile: "C:\\states\\a.dst" },
+    { requireExisting: "lane-a" },
+    { loadSaveFile: "C:\\saves\\a.sav" },
+    { requireExisting: "lane-a" },
+    { exportStateFile: "state" },
+    { requireExisting: "lane-a" },
+    { exportSaveFile: "save" }
   ]);
 });
 
@@ -90,7 +194,7 @@ test("inject_bytes_file and close_all_sessions expose the dedicated top-level op
     }
   };
   const manager = {
-    async create() { return harness; },
+    requireExisting() { return harness; },
     async closeAll() { return 3; }
   };
   const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
@@ -128,7 +232,7 @@ test("direct_status and analysis_context route to compact direct harness helpers
     }
   };
   const manager = {
-    async create(id) {
+    requireExisting(id) {
       assert.equal(id, "lane-a");
       return harness;
     },
@@ -164,7 +268,7 @@ test("rerun_pscript_console returns startup logs through one stdio MCP tool", as
     }
   };
   const manager = {
-    async create() { return harness; },
+    requireExisting() { return harness; },
     async closeAll() {}
   };
   const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
@@ -191,7 +295,7 @@ test("script_console routes a bounded direct console read by script id", async (
     }
   };
   const manager = {
-    async create() { return harness; },
+    requireExisting() { return harness; },
     async closeAll() {}
   };
   const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });

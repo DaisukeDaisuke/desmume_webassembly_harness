@@ -44,5 +44,7 @@ test("default screenshot directory avoids dot-prefixed folders for Codex sandbox
   const configPath = path.join("C:\\workspace", "harness.toml");
   const resolved = resolveHarnessConfig({}, configPath);
   assert.equal(resolved.screenshotPath, path.resolve(path.dirname(path.resolve(configPath)), "harness/screenshots"));
+  assert.equal(resolved.exportPath, path.resolve(path.dirname(path.resolve(configPath)), "harness/exports"));
   assert.equal(resolved.screenshotPath.includes(`${path.sep}.harness${path.sep}`), false);
+  assert.equal(resolved.exportPath.includes(`${path.sep}.harness${path.sep}`), false);
 });

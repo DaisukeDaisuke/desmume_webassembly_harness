@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { preprocessAssemblySource } from "../src/armv5t-assembly-preprocessor.js";
+import { ChromeSession } from "../src/chrome-session.js";
 import { DesmumeHarness } from "../src/desmume-harness.js";
 import { HarnessManager } from "../src/manager.js";
 
@@ -18,6 +19,7 @@ function config(overrides = {}) {
     profileRoot: ".harness/profiles",
     romPath: "C:\\roms\\game.nds",
     screenshotPath: "C:\\shots",
+    exportPath: "C:\\exports",
     baselineName: "analysis-start",
     replaceBaseline: true,
     ...overrides
@@ -83,6 +85,23 @@ test("startAnalyze loads ROM and State, saves the baseline, and returns only com
   assert.equal(fake.events.includes("mcp:stepFrames"), false);
 });
 
+test("restartAnalyze reuses the already loaded Chrome lane without loading the ROM again", async () => {
+  const fake = new FakeAnalyzeSession();
+  fake.romLoaded = true;
+  fake.fileTransactionSerial = 4;
+  const harness = new DesmumeHarness({
+    isolationId: "lane-reuse",
+    config: config(),
+    sessionFactory: () => fake
+  });
+  const statePath = "C:\\states\\next.dst";
+  const result = await harness.restartAnalyze({ statePath });
+  assert.deepEqual(result, { status: "ok", reusedWindow: true, paused: false, running: true });
+  assert.equal(fake.events.some((event) => event.startsWith("upload:ROM:")), false);
+  assert.ok(fake.events.includes(`upload:State In:${statePath}`));
+  assert.ok(fake.events.indexOf("mcp:saveAnalysisBaseline") > fake.events.indexOf(`upload:State In:${statePath}`));
+});
+
 test("ROM startup does not complete until the emulator is actually running", async () => {
   let statusReads = 0;
   const session = {
@@ -137,6 +156,92 @@ test("HarnessManager discards a failed lane and retries start_analyze with a fre
   assert.deepEqual(result, { status: "ok", paused: false, running: true });
   assert.equal(created, 2);
   assert.equal(closed, 1);
+});
+
+test("HarnessManager requires restart_analyze for an existing lane and never creates another harness for restart", async () => {
+  let created = 0;
+  const restarts = [];
+  const manager = new HarnessManager("unused.toml", {
+    configLoader: async () => ({}),
+    harnessFactory: ({ isolationId }) => {
+      created += 1;
+      return {
+        describe: () => ({ isolationId, started: true, alive: true, dead: false, headless: true }),
+        async startAnalyze() { return { status: "ok" }; },
+        async restartAnalyze(input) {
+          restarts.push(input);
+          return { status: "ok", reusedWindow: true, paused: true, running: false };
+        },
+        async close() {}
+      };
+    }
+  });
+  await manager.startAnalyze("lane-a", { statePath: "C:\\states\\first.dst", savePath: undefined });
+  await assert.rejects(
+    () => manager.startAnalyze("lane-a", { statePath: "C:\\states\\second.dst", savePath: undefined }),
+    /use restart_analyze/u
+  );
+  const restarted = await manager.restartAnalyze(undefined, { statePath: "C:\\states\\second.dst", savePath: undefined });
+  assert.equal(restarted.reusedWindow, true);
+  assert.equal(created, 1);
+  assert.deepEqual(restarts, [{ statePath: "C:\\states\\second.dst", savePath: undefined }]);
+});
+
+test("concurrent start_analyze calls for one isolation id cannot create two Chrome lanes", async () => {
+  let releaseFirst;
+  let created = 0;
+  const firstStarted = new Promise((resolve) => { releaseFirst = resolve; });
+  let entered;
+  const enteredStart = new Promise((resolve) => { entered = resolve; });
+  const manager = new HarnessManager("unused.toml", {
+    configLoader: async () => ({}),
+    harnessFactory: () => {
+      created += 1;
+      return {
+        async startAnalyze() {
+          entered();
+          await firstStarted;
+          return { status: "ok", paused: true, running: false };
+        },
+        async close() {}
+      };
+    }
+  });
+  const first = manager.startAnalyze("lane-race", { statePath: "C:\\states\\first.dst" });
+  await enteredStart;
+  await assert.rejects(
+    () => manager.startAnalyze("lane-race", { statePath: "C:\\states\\second.dst" }),
+    /already starting|already exists/u
+  );
+  releaseFirst();
+  await first;
+  assert.equal(created, 1);
+});
+
+test("listInstances reports live/dead lane state without starting or probing Chrome", () => {
+  const manager = new HarnessManager("unused.toml");
+  manager.instances.set("lane-b", {
+    describe: () => ({ isolationId: "lane-b", started: true, alive: false, dead: true, headless: false })
+  });
+  manager.instances.set("lane-a", {
+    describe: () => ({ isolationId: "lane-a", started: true, alive: true, dead: false, headless: true })
+  });
+  assert.deepEqual(manager.listInstances(), {
+    total: 2,
+    returned: 2,
+    truncated: false,
+    instances: [
+      { isolationId: "lane-a", started: true, alive: true, dead: false, headless: true },
+      { isolationId: "lane-b", started: true, alive: false, dead: true, headless: false }
+    ]
+  });
+});
+
+test("a closed or crashed Chrome session is rejected instead of being silently recreated", async () => {
+  const session = new ChromeSession({ isolationId: "dead-lane", config: config() });
+  session.chrome = { exitCode: 1 };
+  session.cdp = { isOpen: () => false };
+  await assert.rejects(() => session.start(), /no longer alive/u);
 });
 
 test("Save start imports Save In after ROM startup and preserves the resulting run state", async () => {
@@ -238,6 +343,111 @@ test("screenshot rejects a name that escapes the configured screenshot directory
   await assert.rejects(() => harness.screenshot("..\\outside.png"), /must be a file name/u);
 });
 
+test("listCommands pages the live runtime inventory and omits descriptions unless requested", async () => {
+  const inventory = Object.fromEntries(Array.from({ length: 90 }, (_, index) => [
+    `command${String(index).padStart(3, "0")}`,
+    `description-${index}`
+  ]));
+  const session = {
+    async start() {},
+    async listCommandsDirect() { return inventory; },
+    async close() {}
+  };
+  const harness = new DesmumeHarness({
+    isolationId: "lane-list",
+    config: config(),
+    sessionFactory: () => session
+  });
+  const first = await harness.listCommands();
+  assert.equal(first.total, 90);
+  assert.equal(first.returned, 64);
+  assert.equal(first.nextOffset, 64);
+  assert.equal(first.commands[0], "command000");
+  assert.equal(typeof first.commands[0], "string");
+  const second = await harness.listCommands({ offset: first.nextOffset, limit: 64, includeDescriptions: true });
+  assert.equal(second.returned, 26);
+  assert.equal(second.nextOffset, null);
+  assert.deepEqual(second.commands[0], { name: "command064", description: "description-64" });
+});
+
+test("managed State and Save exports return only path and byte count", async () => {
+  const calls = [];
+  const exportPath = path.join(os.tmpdir(), "desmume-harness-export-target");
+  const session = {
+    async start() {},
+    async downloadCommandToFile(command, params, destinationPath, timeoutMs) {
+      calls.push({ command, params, destinationPath, timeoutMs });
+      return { result: { ok: true, privateBytes: [1, 2, 3] }, path: destinationPath, bytes: command === "exportStateFile" ? 4096 : 512 };
+    },
+    async close() {}
+  };
+  const harness = new DesmumeHarness({
+    isolationId: "lane-export",
+    config: config({ exportPath, fileTimeoutMs: 4321 }),
+    sessionFactory: () => session
+  });
+  const state = await harness.exportStateFile();
+  const save = await harness.exportSaveFile("manual");
+  assert.deepEqual(state, {
+    ok: true,
+    kind: "state",
+    path: path.join(exportPath, "state-000001.dst"),
+    bytes: 4096
+  });
+  assert.deepEqual(save, {
+    ok: true,
+    kind: "save",
+    path: path.join(exportPath, "manual.sav"),
+    bytes: 512
+  });
+  assert.deepEqual(calls.map(({ command, destinationPath, timeoutMs }) => ({ command, destinationPath, timeoutMs })), [
+    { command: "exportStateFile", destinationPath: path.join(exportPath, "state-000001.dst"), timeoutMs: 4321 },
+    { command: "exportSaveFile", destinationPath: path.join(exportPath, "manual.sav"), timeoutMs: 4321 }
+  ]);
+  assert.equal(Object.hasOwn(state, "result"), false);
+  assert.equal(Object.hasOwn(save, "result"), false);
+});
+
+test("ChromeSession managed export captures only the requested DeSmuME download and moves it to the destination", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "desmume-harness-cdp-export-"));
+  const destination = path.join(directory, "exports", "capture.dst");
+  const listeners = new Map();
+  let downloadPath = null;
+  const session = new ChromeSession({
+    isolationId: "lane-cdp-export",
+    config: config({ profileRoot: path.join(directory, "profiles") })
+  });
+  session.chrome = { exitCode: null };
+  session.cdp = {
+    isOpen: () => true,
+    onEvent(method, listener) {
+      listeners.set(method, listener);
+      return () => listeners.delete(method);
+    },
+    async send(method, params) {
+      if (method === "Browser.setDownloadBehavior" && params.behavior === "allow") downloadPath = params.downloadPath;
+      return {};
+    }
+  };
+  session.callDirect = async (command) => {
+    assert.equal(command, "exportStateFile");
+    assert.ok(downloadPath);
+    listeners.get("Browser.downloadWillBegin")({ guid: "other", suggestedFilename: "unrelated.bin" });
+    listeners.get("Browser.downloadProgress")({ guid: "other", state: "completed" });
+    await writeFile(path.join(downloadPath, "desmume-state.dst"), Buffer.from([1, 2, 3, 4]));
+    listeners.get("Browser.downloadWillBegin")({ guid: "state-guid", suggestedFilename: "desmume-state.dst" });
+    listeners.get("Browser.downloadProgress")({ guid: "state-guid", state: "completed" });
+    return { ok: true, size: 4 };
+  };
+  t.after(async () => {
+    await rm(directory, { recursive: true, force: true });
+  });
+  const result = await session.downloadCommandToFile("exportStateFile", {}, destination, 1000);
+  assert.equal(result.path, destination);
+  assert.equal(result.bytes, 4);
+  assert.deepEqual(await readFile(destination), Buffer.from([1, 2, 3, 4]));
+});
+
 class FakeScriptSession {
   constructor(source) {
     this.source = source;
@@ -291,11 +501,11 @@ test("rerunPScript stops the same explicit name and directly starts the source l
   assert.deepEqual(fake.events, [
     "mcp:listScripts",
     "mcp:stopScript",
-    "snapshot",
     "upload:Load source",
     "editor-ready",
     "mcp:runLoadedPersistentScript"
   ]);
+  assert.equal(Object.hasOwn(result, "snapshot"), false);
 });
 
 test("rerunPScriptConsole skips UI snapshot output and returns startup console in one harness call", async () => {
@@ -359,30 +569,58 @@ test("scriptConsole reads one persistent-script console directly by id", async (
   });
 });
 
-test("analysisContext stays compact and omits call stack, disassembly, and breakpoint list by default", async () => {
+test("analysisContext is rebuilt from live browser state and keeps bounded collections", async () => {
   const session = {
     async start() {},
     async callDirect(command) {
       if (command === "status") return {
         ok: true,
         romLoaded: true,
+        romSize: 123456,
         paused: true,
         running: false,
         frame: 123,
-        recentFiles: [{ kind: "state", name: "fallback.dst" }],
+        stateLoadSerial: 9,
+        fileTransaction: { active: false, serial: 12, reason: "" },
+        cpu: "arm9",
+        recentFiles: [{ id: "recent-1", kind: "state", name: "fallback.dst", slot: "a", size: 999 }],
         native: {
           traceEnabled: true,
           arm9: { pc: 0x02012344, cpsr: 0x6000001f },
           lastBreak: { hit: true, kind: 0, cpu: "arm9", address: 0x02012344, pc: 0x02012344 }
         }
       };
-      if (command === "snapshotContext") return { ok: true, skipIrq: true, nearPc: ["must-not-escape"] };
-      if (command === "listAnalysisBaselines") return { baselines: [{ name: "analysis-start" }] };
-      if (command === "listScripts") return { scripts: [
-        { id: 3, name: "overlay", running: true, started: true, registrationComplete: true, mcpCount: 0 },
-        { id: 4, name: "stopped", running: false }
-      ] };
-      if (command === "listBreakpoints") return [{ id: 1, type: "exec", address: 0x02012344 }];
+      if (command === "snapshotContext") return {
+        ok: true,
+        cpu: "arm9",
+        registers: { pc: "0x02012344", sp: "0x023ff000", lr: "0x02010000", cpsr: "0x6000001f" },
+        skipIrq: true,
+        traceEnabled: true,
+        nearPc: ["must-not-escape"]
+      };
+      if (command === "listAnalysisBaselines") return {
+        baselines: Array.from({ length: 20 }, (_, index) => ({ name: index === 0 ? "analysis-start" : `baseline-${index}` }))
+      };
+      if (command === "listScripts") return {
+        scripts: [
+          ...Array.from({ length: 20 }, (_, index) => ({
+            id: index + 3,
+            name: index === 0 ? "overlay" : `script-${index}`,
+            running: true,
+            started: true,
+            registrationComplete: true,
+            mcpCount: 0
+          })),
+          { id: 100, name: "stopped", running: false }
+        ]
+      };
+      if (command === "listBreakpoints") return Array.from({ length: 140 }, (_, index) => ({
+        id: index + 1,
+        cpu: "arm9",
+        type: "exec",
+        address: 0x02012344 + index * 4,
+        enabled: true
+      }));
       throw new Error(`unexpected command ${command}`);
     },
     async close() {}
@@ -392,24 +630,34 @@ test("analysisContext stays compact and omits call stack, disassembly, and break
     config: config(),
     sessionFactory: () => session
   });
-  harness.currentStatePath = path.resolve("C:\\states\\current.dst");
-  harness.scriptSourcePaths.set(3, path.resolve("C:\\scripts\\overlay.js"));
   const result = await harness.analysisContext();
-  assert.equal(result.stateName, path.basename(path.resolve("C:\\states\\current.dst")));
-  assert.equal(result.baselineName, "analysis-start");
-  assert.equal(result.baselinePresent, true);
+  assert.equal(result.romLoaded, true);
+  assert.equal(result.romSize, 123456);
   assert.equal(result.paused, true);
   assert.equal(result.running, false);
+  assert.equal(result.stateLoadSerial, 9);
+  assert.equal(result.fileTransaction.serial, 12);
+  assert.equal(result.registers.pc, "0x02012344");
   assert.equal(result.break.kind, "exec");
   assert.equal(result.skipIrq, true);
-  assert.equal(result.scripts.length, 1);
+  assert.equal(result.baselines[0].name, "analysis-start");
+  assert.equal(result.recentFiles[0].name, "fallback.dst");
+  assert.equal(result.baselines.length, 16);
+  assert.equal(result.baselinesTruncated, true);
+  assert.equal(result.scripts.length, 16);
+  assert.equal(result.scriptsTruncated, true);
   assert.equal(result.scripts[0].id, 3);
+  assert.equal(Object.hasOwn(result.scripts[0], "sourcePath"), false);
+  assert.equal(Object.hasOwn(result, "statePath"), false);
+  assert.equal(Object.hasOwn(result, "stateName"), false);
   assert.equal(Object.hasOwn(result, "breakpoints"), false);
   assert.equal(Object.hasOwn(result, "callStack"), false);
   assert.equal(Object.hasOwn(result, "disassembly"), false);
   assert.equal(Object.hasOwn(result, "nearPc"), false);
   const withBreakpoints = await harness.analysisContext({ includeBreakpoints: true });
-  assert.deepEqual(withBreakpoints.breakpoints, [{ id: 1, type: "exec", address: 0x02012344 }]);
+  assert.equal(withBreakpoints.breakpoints.length, 128);
+  assert.equal(withBreakpoints.breakpointsTruncated, true);
+  assert.deepEqual(withBreakpoints.breakpoints[0], { id: 1, cpu: "arm9", type: "exec", address: 0x02012344, enabled: true });
 });
 
 class FakeWebMcpSession {

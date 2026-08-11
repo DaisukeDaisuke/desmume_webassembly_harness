@@ -12,6 +12,7 @@ const DEFAULTS = Object.freeze({
   profile_root: ".harness/profiles",
   rom_path: "",
   screenshot_path: "harness/screenshots",
+  export_path: "harness/exports",
   baseline_name: "analysis-start",
   replace_baseline: true
 });
@@ -168,6 +169,7 @@ export function resolveHarnessConfig(raw, configPath, isolationId = "default") {
   if (typeof merged.url !== "string" || !merged.url) throw new Error("url must be a non-empty string");
   if (typeof merged.headless !== "boolean") throw new Error("headless must be boolean");
   if (typeof merged.screenshot_path !== "string" || !merged.screenshot_path) throw new Error("screenshot_path must be a non-empty string");
+  if (typeof merged.export_path !== "string" || !merged.export_path) throw new Error("export_path must be a non-empty string");
   if (typeof merged.baseline_name !== "string" || !merged.baseline_name) throw new Error("baseline_name must be a non-empty string");
   if (typeof merged.replace_baseline !== "boolean") throw new Error("replace_baseline must be boolean");
   return Object.freeze({
@@ -180,6 +182,7 @@ export function resolveHarnessConfig(raw, configPath, isolationId = "default") {
     profileRoot: absoluteFrom(baseDir, merged.profile_root),
     romPath: absoluteFrom(baseDir, merged.rom_path),
     screenshotPath: absoluteFrom(baseDir, merged.screenshot_path),
+    exportPath: absoluteFrom(baseDir, merged.export_path),
     baselineName: merged.baseline_name,
     replaceBaseline: merged.replace_baseline
   });

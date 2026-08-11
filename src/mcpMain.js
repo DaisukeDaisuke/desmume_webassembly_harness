@@ -5,7 +5,7 @@ import { HarnessManager } from "./manager.js";
 import { compactOutputText } from "./compact-output.js";
 
 const SERVER_NAME = "desmume-webassembly-harness";
-const SERVER_VERSION = "0.4.0";
+const SERVER_VERSION = "0.5.0";
 const SUPPORTED_PROTOCOLS = new Set([
   "2025-11-25",
   "2025-06-18",
@@ -22,12 +22,19 @@ const objectSchema = (properties = {}, required = []) => ({
 
 const isolationProperty = {
   type: "string",
-  description: "Emulator isolation id. Different ids run in separate Chrome profiles and DevTools ports.",
+  description: "Existing emulator isolation id. Omit only when exactly one instance exists.",
   minLength: 1,
   maxLength: 64,
-  pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+  pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+};
+
+const startIsolationProperty = {
+  ...isolationProperty,
+  description: "New emulator isolation id. Omit to create the default lane.",
   default: "default"
 };
+
+const existingIsolationProperty = isolationProperty;
 
 const timeoutProperty = {
   type: "integer",
@@ -39,12 +46,71 @@ const timeoutProperty = {
 const TOOLS = Object.freeze([
   {
     name: "start_analyze",
-    description: "Start or reuse an isolated Chrome/DeSmuME instance, load the configured ROM and caller-supplied State, create the configured analysis baseline, and return only status/paused/running.",
+    description: "Create a new Chrome/DeSmuME lane, load ROM plus one State/Save, save the analysis baseline, and return compact run state. If the lane already exists, use restart_analyze.",
     inputSchema: objectSchema({
-      isolation_id: isolationProperty,
+      isolation_id: startIsolationProperty,
       state_path: { type: "string", minLength: 1, description: "Local State file to load for this analysis start." },
       save_path: { type: "string", minLength: 1, description: "Local .sav/.dsv file to load instead of a State." }
     }, [])
+  },
+  {
+    name: "restart_analyze",
+    description: "Reuse an existing Chrome window, load one State/Save, refresh the analysis baseline, and return compact run state.",
+    inputSchema: objectSchema({
+      isolation_id: existingIsolationProperty,
+      state_path: { type: "string", minLength: 1 },
+      save_path: { type: "string", minLength: 1 }
+    })
+  },
+  {
+    name: "list_instances",
+    description: "List managed emulator lanes without creating Chrome. Results are bounded.",
+    inputSchema: objectSchema({}),
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: "list_commands",
+    description: "Read the runtime DesmumeMCP.list() inventory with bounded paging; names only by default.",
+    inputSchema: objectSchema({
+      isolation_id: existingIsolationProperty,
+      filter: { type: "string", maxLength: 128 },
+      offset: { type: "integer", minimum: 0, default: 0 },
+      limit: { type: "integer", minimum: 1, maximum: 64, default: 64 },
+      include_descriptions: { type: "boolean", default: false }
+    }),
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: "load_state_file",
+    description: "Load one local State into an existing lane without creating another Chrome window.",
+    inputSchema: objectSchema({
+      isolation_id: existingIsolationProperty,
+      path: { type: "string", minLength: 1 }
+    }, ["path"])
+  },
+  {
+    name: "load_save_file",
+    description: "Load one local Save into an existing lane without creating another Chrome window.",
+    inputSchema: objectSchema({
+      isolation_id: existingIsolationProperty,
+      path: { type: "string", minLength: 1 }
+    }, ["path"])
+  },
+  {
+    name: "export_state_file",
+    description: "Export the current State into export_path without returning State bytes.",
+    inputSchema: objectSchema({
+      isolation_id: existingIsolationProperty,
+      name: { type: "string", minLength: 1, maxLength: 255 }
+    })
+  },
+  {
+    name: "export_save_file",
+    description: "Export the current Save into export_path without returning Save bytes.",
+    inputSchema: objectSchema({
+      isolation_id: existingIsolationProperty,
+      name: { type: "string", minLength: 1, maxLength: 255 }
+    })
   },
   {
     name: "status",
@@ -60,7 +126,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: "analysis_context",
-    description: "Return a compact cross-chat continuation context: State/baseline identity, pause/run state, frame, ARM9 PC/CPSR, latest break, and running persistent scripts. Call stack and disassembly are intentionally omitted.",
+    description: "Return bounded live emulator context from browser APIs, not harness-tracked State/script paths.",
     inputSchema: objectSchema({
       isolation_id: isolationProperty,
       include_breakpoints: { type: "boolean", default: false, description: "Include the current breakpoint list only when explicitly needed." }
@@ -273,6 +339,15 @@ function optionalIsolation(args) {
   return value;
 }
 
+function optionalExistingIsolation(args) {
+  if (args.isolation_id === undefined) return undefined;
+  const value = args.isolation_id;
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(value)) {
+    throw new Error("isolation_id must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$");
+  }
+  return value;
+}
+
 function optionalTimeout(args, key, fallback) {
   if (args[key] === undefined) return fallback;
   const value = Number(args[key]);
@@ -340,8 +415,12 @@ export class McpHarnessServer {
     this.initialized = false;
   }
 
-  async #harness(args) {
-    return await this.manager.create(optionalIsolation(args));
+  #harness(args) {
+    return this.manager.requireExisting(optionalExistingIsolation(args));
+  }
+
+  #existingHarness(args) {
+    return this.manager.requireExisting(optionalExistingIsolation(args));
   }
 
   async #callTool(name, rawArguments) {
@@ -357,6 +436,35 @@ export class McpHarnessServer {
           statePath: args.state_path,
           savePath: args.save_path
         });
+      case "restart_analyze":
+        if ((args.state_path === undefined) === (args.save_path === undefined)) {
+          throw new Error("exactly one of state_path or save_path is required");
+        }
+        if (args.state_path !== undefined && (typeof args.state_path !== "string" || !args.state_path.trim())) throw new Error("state_path must be a non-empty string");
+        if (args.save_path !== undefined && (typeof args.save_path !== "string" || !args.save_path.trim())) throw new Error("save_path must be a non-empty string");
+        return await this.manager.restartAnalyze(optionalExistingIsolation(args), {
+          statePath: args.state_path,
+          savePath: args.save_path
+        });
+      case "list_instances":
+        return this.manager.listInstances();
+      case "list_commands":
+        return await this.#existingHarness(args).listCommands({
+          filter: args.filter ?? "",
+          offset: args.offset ?? 0,
+          limit: args.limit ?? 64,
+          includeDescriptions: args.include_descriptions ?? false
+        });
+      case "load_state_file":
+        if (typeof args.path !== "string" || !args.path.trim()) throw new Error("path is required");
+        return await this.#existingHarness(args).loadStateFile(args.path);
+      case "load_save_file":
+        if (typeof args.path !== "string" || !args.path.trim()) throw new Error("path is required");
+        return await this.#existingHarness(args).loadSaveFile(args.path);
+      case "export_state_file":
+        return await this.#existingHarness(args).exportStateFile(args.name);
+      case "export_save_file":
+        return await this.#existingHarness(args).exportSaveFile(args.name);
       case "status":
         return await (await this.#harness(args)).status();
       case "direct_status":
@@ -460,8 +568,10 @@ export class McpHarnessServer {
         if (typeof args.file_path !== "string" || !args.file_path.trim()) throw new Error("file_path is required");
         return await (await this.#harness(args)).injectBytesFile(args.file_path, args.address, args.cpu);
       }
-      case "close_instance":
-        return { closed: await this.manager.close(optionalIsolation(args)) };
+      case "close_instance": {
+        const harness = this.manager.requireExisting(optionalExistingIsolation(args));
+        return { closed: await this.manager.close(harness.isolationId) };
+      }
       case "close_all_sessions":
         return { closed: await this.manager.closeAll() };
       default:
@@ -491,7 +601,7 @@ export class McpHarnessServer {
           title: "DeSmuME WebAssembly Harness",
           version: SERVER_VERSION
         },
-        instructions: "Pass exactly one of state_path or save_path to every start_analyze call. Startup is accepted only after ROM load reaches running=true; failed starts discard the lane and retry with a fresh Chrome after 500ms. Reusing a healthy isolation_id reuses its Chrome instance. Use analysis_context when continuing work across chats; it intentionally omits call stack/disassembly. Use direct_status for raw status without the inner WebMCP transport. screenshot saves only the DeSmuME framebuffer to screenshot_path from harness.toml. Use inject_bytes_file for bounded absolute-file byte injection. close_all_sessions closes all Chrome children managed by this MCP process."
+        instructions: "Use start_analyze only to create a new lane. Use list_instances then restart_analyze to reuse an existing Chrome window; restart_analyze may omit isolation_id only when exactly one lane exists. A Chrome window closed or crashed by the user is a dead session and is not automatically revived. load_state_file/load_save_file switch local files in an existing lane. export_state_file/export_save_file write under export_path without returning file bytes. list_commands is paged and names-only by default. analysis_context is bounded live browser/emulator state and does not depend on harness-tracked State/script paths. screenshot saves only the DeSmuME framebuffer to screenshot_path."
       });
     }
     if (message.method === "ping") return response(id, {});
