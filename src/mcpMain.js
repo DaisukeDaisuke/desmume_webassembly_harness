@@ -173,7 +173,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: "rerun_pscript",
-    description: "Stop an existing persistent script with the same explicit name, load the UTF-8 source into the Persistent Scripts editor, then call runLoadedPersistentScript directly without UI-click automation.",
+    description: "Load the UTF-8 source into the Persistent Scripts editor, then call runLoadedPersistentScript directly without UI-click automation. Same-name replacement is delegated to the page's update path so script-only breakpoint traps can be released correctly.",
     inputSchema: objectSchema({
       isolation_id: isolationProperty,
       path: { type: "string", minLength: 1 },

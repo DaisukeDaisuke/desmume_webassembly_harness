@@ -142,10 +142,9 @@ frame=42
 ```
 ## Persistent Scripts
 `rerun_pscript` は固定UIDや `Run / Update` のclickを使用しません。
-1. 明示 `name` と同名のrunning scriptがあれば `listScripts` からidを解決して `stopScript` する。
-2. `Load source` file inputを現在DOMから直接解決してローカルUTF-8 sourceを投入する。UI snapshotは取得も返却もしない。
-3. editorへsourceが反映されたことを確認する。
-4. `runLoadedPersistentScript` を直接呼ぶ。
+1. `Load source` file inputを現在DOMから直接解決してローカルUTF-8 sourceを投入する。UI snapshotは取得も返却もしない。
+2. textareaの改行正規化（CRLF/CR→LF）を考慮して、editorへsourceが反映されたことを確認する。
+3. `runLoadedPersistentScript` を直接呼ぶ。同名scriptの置換はページ本体のupdate経路へ任せ、script-only breakpoint処理中でも通常の`stopScript`でpaused状態を固定しない。
 `wait_for_registration=false` ならAPI_CURRENTの `started:true` 時点で返し、registration完了を待ちません。`startup_timeout_ms` はWorker/parser/compile/started handshakeだけに適用され、script bodyのtimeoutにはしません。
 ## UTF-8
 `harness.toml` とローカルJavaScript sourceはUTF-8のみ受け付けます。UTF-16/UTF-32 BOMまたは不正UTF-8は実行前にエラーにします。

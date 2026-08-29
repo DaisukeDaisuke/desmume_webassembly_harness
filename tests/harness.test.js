@@ -244,6 +244,25 @@ test("a closed or crashed Chrome session is rejected instead of being silently r
   await assert.rejects(() => session.start(), /no longer alive/u);
 });
 
+test("persistent script editor readiness compares against textarea-normalized newlines", async () => {
+  const session = new ChromeSession({ isolationId: "newline-lane", config: config() });
+  session.chrome = { exitCode: null };
+  let comparedSource = null;
+  session.cdp = {
+    isOpen: () => true,
+    async send(method, params) {
+      if (method === "Runtime.evaluate") return { result: { objectId: "global" } };
+      if (method === "Runtime.callFunctionOn") {
+        comparedSource = params.arguments[0].value;
+        return { result: { value: true } };
+      }
+      throw new Error(`unexpected CDP method ${method}`);
+    }
+  };
+  await session.waitForScriptEditorSource("one\r\ntwo\rthree\n", 1000);
+  assert.equal(comparedSource, "one\ntwo\nthree\n");
+});
+
 test("Save start imports Save In after ROM startup and preserves the resulting run state", async () => {
   const fake = new FakeAnalyzeSession();
   fake.uploadFileByLabel = async function (label, filePath) {
@@ -465,11 +484,6 @@ class FakeScriptSession {
   }
   async callDirect(command, params) {
     this.events.push(`mcp:${command}`);
-    if (command === "listScripts") return { ok: true, scripts: [{ id: 7, name: "observer", running: true }] };
-    if (command === "stopScript") {
-      assert.equal(params.id, 7);
-      return { ok: true, id: 7, stopped: true };
-    }
     if (command === "runLoadedPersistentScript") {
       assert.equal(params.name, "observer");
       assert.equal(params.asyncMode, false);
@@ -485,7 +499,7 @@ class FakeScriptSession {
   async close() {}
 }
 
-test("rerunPScript stops the same explicit name and directly starts the source loaded through the file input", async () => {
+test("rerunPScript delegates same-name replacement to runLoadedPersistentScript", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "desmume-harness-"));
   const scriptPath = path.join(directory, "observer.js");
   const source = "return { fallbackId: 'observer', mcps: [] };\n";
@@ -498,9 +512,8 @@ test("rerunPScript stops the same explicit name and directly starts the source l
   });
   const result = await harness.rerunPScript(scriptPath, false, "observer");
   assert.equal(result.script.name, "observer");
+  assert.equal(result.stopped, null);
   assert.deepEqual(fake.events, [
-    "mcp:listScripts",
-    "mcp:stopScript",
     "upload:Load source",
     "editor-ready",
     "mcp:runLoadedPersistentScript"

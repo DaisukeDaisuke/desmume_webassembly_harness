@@ -362,12 +362,8 @@ export class DesmumeHarness {
     if (typeof asyncMode !== "boolean") throw new Error("asyncMode must be boolean");
     const absolute = path.resolve(filePath);
     const source = await readUtf8Text(absolute);
-    let stopped = null;
     if (name !== undefined) {
       if (typeof name !== "string" || !name.trim()) throw new Error("name must be a non-empty string when provided");
-      const listed = await this.listScripts();
-      const existing = listed.scripts?.find((candidate) => candidate.name === name);
-      if (existing) stopped = requireOk(await this.#directCall("stopScript", { id: existing.id }), "stopScript before rerunPScript");
     }
     await this.session.uploadFileByLabel("Load source", absolute);
     await this.session.waitForScriptEditorSource(source, this.config.fileTimeoutMs);
@@ -381,7 +377,7 @@ export class DesmumeHarness {
       await this.#directCall("runLoadedPersistentScript", params, timeoutMs),
       "runLoadedPersistentScript"
     );
-    return { ok: true, stopped, script };
+    return { ok: true, stopped: null, script };
   }
 
   async rerunPScriptConsole(filePath, asyncMode = false, name, {

@@ -402,12 +402,13 @@ export class ChromeSession {
   }
 
   async waitForScriptEditorSource(source, timeoutMs = this.config.fileTimeoutMs) {
+    const expectedSource = String(source).replace(/\r\n?/gu, "\n");
     return await this.waitForFunction(function (expected) {
       const labels = [...document.querySelectorAll('label')];
       const label = labels.find((candidate) => String(candidate.textContent ?? '').includes('JavaScript script'));
       const textarea = label?.querySelector('textarea');
       return !!textarea && textarea.value === expected;
-    }, [source], timeoutMs, "persistent script editor source");
+    }, [expectedSource], timeoutMs, "persistent script editor source");
   }
 
   async close() {
