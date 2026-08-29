@@ -311,6 +311,108 @@ test("script_console routes a bounded direct console read by script id", async (
   assert.equal(reply.result.structuredContent.logs[0].text, "ready");
 });
 
+test("micro macros register top-level MCP calls, list/get them, and re-execute by id", async () => {
+  const calls = [];
+  const harness = {
+    config: { commandTimeoutMs: 600000, baselineName: "base", replaceBaseline: true },
+    async resume() {
+      calls.push("resume");
+      return { ok: true, running: true, paused: false };
+    },
+    async call(command, params) {
+      calls.push({ command, params });
+      return { ok: true, command };
+    }
+  };
+  const manager = {
+    requireExisting(id) {
+      assert.equal(id, "lane-a");
+      return harness;
+    },
+    async closeAll() {}
+  };
+  const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
+  const first = await server.handle({
+    jsonrpc: "2.0",
+    id: 40,
+    method: "tools/call",
+    params: {
+      name: "micro_macro_exec",
+      arguments: {
+        id: "turn-flow",
+        isolation_id: "lane-a",
+        steps: [
+          { wait_ms: 0, tool: "call", arguments: { command: "pressButtons", params: { buttons: ["A"] } } },
+          { wait_ms: 1, tool: "resume", arguments: {} }
+        ]
+      }
+    }
+  });
+  assert.equal(first.result.structuredContent.id, "turn-flow");
+  assert.equal(first.result.structuredContent.stepCount, 2);
+  assert.deepEqual(calls, [
+    { command: "pressButtons", params: { buttons: ["A"] } },
+    "resume"
+  ]);
+
+  const listed = await server.handle({
+    jsonrpc: "2.0",
+    id: 41,
+    method: "tools/call",
+    params: { name: "micro_macro_list", arguments: {} }
+  });
+  assert.deepEqual(listed.result.structuredContent.macros, [
+    { id: "turn-flow", stepCount: 2, totalWaitMs: 1 }
+  ]);
+
+  const fetched = await server.handle({
+    jsonrpc: "2.0",
+    id: 42,
+    method: "tools/call",
+    params: { name: "micro_macro_get", arguments: { id: "turn-flow" } }
+  });
+  assert.equal(fetched.result.structuredContent.steps[1].tool, "resume");
+  assert.equal(fetched.result.structuredContent.steps[1].wait_ms, 1);
+
+  await server.handle({
+    jsonrpc: "2.0",
+    id: 43,
+    method: "tools/call",
+    params: { name: "micro_macro_exec", arguments: { id: "turn-flow", isolation_id: "lane-a" } }
+  });
+  assert.equal(calls.length, 4);
+});
+
+test("micro macros reject recursive macro execution and unknown top-level tools", async () => {
+  const server = new McpHarnessServer({
+    configPath: "harness.toml",
+    managerFactory: () => ({ async closeAll() {} })
+  });
+  const recursive = await server.handle({
+    jsonrpc: "2.0",
+    id: 44,
+    method: "tools/call",
+    params: {
+      name: "micro_macro_exec",
+      arguments: { id: "recursive", steps: [{ tool: "micro_macro_exec", arguments: { id: "recursive" } }] }
+    }
+  });
+  assert.equal(recursive.result.isError, true);
+  assert.match(recursive.result.content[0].text, /cannot invoke another micro_macro tool/u);
+
+  const unknown = await server.handle({
+    jsonrpc: "2.0",
+    id: 45,
+    method: "tools/call",
+    params: {
+      name: "micro_macro_exec",
+      arguments: { id: "unknown", steps: [{ tool: "does_not_exist", arguments: {} }] }
+    }
+  });
+  assert.equal(unknown.result.isError, true);
+  assert.match(unknown.result.content[0].text, /unknown top-level tool/u);
+});
+
 test("stdio MCP initialize returns server instructions and negotiates the requested supported protocol", async () => {
   const server = new McpHarnessServer({
     configPath: "harness.toml",
@@ -365,6 +467,7 @@ test("mcpMain runs as a newline-delimited stdio MCP process", async (t) => {
   const tools = JSON.parse((await iterator.next()).value);
   assert.equal(tools.id, 2);
   assert.ok(tools.result.tools.some((tool) => tool.name === "start_analyze"));
+  assert.ok(tools.result.tools.some((tool) => tool.name === "micro_macro_exec"));
   child.stdin.end();
   await once(child, "exit");
   assert.equal(child.exitCode, 0);

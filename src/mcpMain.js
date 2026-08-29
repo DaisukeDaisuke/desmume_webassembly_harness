@@ -1,11 +1,12 @@
 import path from "node:path";
 import process from "node:process";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { HarnessManager } from "./manager.js";
 import { compactOutputText } from "./compact-output.js";
 
 const SERVER_NAME = "desmume-webassembly-harness";
-const SERVER_VERSION = "0.5.0";
+const SERVER_VERSION = "0.6.0";
 const SUPPORTED_PROTOCOLS = new Set([
   "2025-11-25",
   "2025-06-18",
@@ -42,6 +43,33 @@ const timeoutProperty = {
   maximum: 600000,
   description: "Operation timeout in milliseconds."
 };
+
+const microMacroIdProperty = {
+  type: "string",
+  minLength: 1,
+  maxLength: 64,
+  pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+  description: "AI-chosen micro-macro id."
+};
+
+const microMacroStepSchema = objectSchema({
+  wait_ms: {
+    type: "integer",
+    minimum: 0,
+    maximum: 600000,
+    default: 0,
+    description: "Milliseconds to wait immediately before invoking this top-level MCP tool."
+  },
+  tool: {
+    type: "string",
+    minLength: 1,
+    description: "Top-level desmume_harness MCP tool name to invoke through its normal handler."
+  },
+  arguments: {
+    type: "object",
+    additionalProperties: true
+  }
+}, ["tool"]);
 
 const TOOLS = Object.freeze([
   {
@@ -152,6 +180,35 @@ const TOOLS = Object.freeze([
       params: { type: "object", additionalProperties: true },
       timeout_ms: timeoutProperty
     }, ["command"])
+  },
+  {
+    name: "micro_macro_list",
+    description: "List in-memory micro macros registered in this harness process.",
+    inputSchema: objectSchema({}),
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: "micro_macro_get",
+    description: "Return one registered micro macro including its top-level MCP steps and waits.",
+    inputSchema: objectSchema({
+      id: microMacroIdProperty
+    }, ["id"]),
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: "micro_macro_exec",
+    description: "Register/replace and execute an AI-named micro macro, or execute a previously registered id. Each step waits wait_ms, then invokes the named top-level MCP tool through the same normal handler used for an individual tools/call request.",
+    inputSchema: objectSchema({
+      id: microMacroIdProperty,
+      isolation_id: isolationProperty,
+      steps: {
+        type: "array",
+        minItems: 1,
+        maxItems: 128,
+        items: microMacroStepSchema,
+        description: "When supplied, replaces the stored definition before execution. Omit to re-execute the stored id."
+      }
+    }, ["id"])
   },
   {
     name: "eval",
@@ -370,6 +427,44 @@ function scriptSelector(args) {
   return args.name.trim();
 }
 
+function microMacroId(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(value)) {
+    throw new Error("micro macro id must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$");
+  }
+  return value;
+}
+
+function microMacroSteps(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 128) {
+    throw new Error("micro macro steps must contain from 1 through 128 steps");
+  }
+  return value.map((rawStep, index) => {
+    const step = requireObject(rawStep, `micro macro step ${index}`);
+    const keys = Object.keys(step);
+    const unexpected = keys.find((key) => !["wait_ms", "tool", "arguments"].includes(key));
+    if (unexpected) throw new Error(`micro macro step ${index} contains unsupported key ${unexpected}`);
+    const waitMs = step.wait_ms === undefined ? 0 : Number(step.wait_ms);
+    if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 600000) {
+      throw new Error(`micro macro step ${index}.wait_ms must be an integer from 0 through 600000`);
+    }
+    if (typeof step.tool !== "string" || !step.tool.trim()) {
+      throw new Error(`micro macro step ${index}.tool must be a non-empty string`);
+    }
+    const tool = step.tool.trim();
+    if (tool.startsWith("micro_macro_")) {
+      throw new Error(`micro macro step ${index} cannot invoke another micro_macro tool`);
+    }
+    if (!TOOLS.some((candidate) => candidate.name === tool)) {
+      throw new Error(`micro macro step ${index} references unknown top-level tool ${tool}`);
+    }
+    return {
+      wait_ms: waitMs,
+      tool,
+      arguments: structuredClone(requireObject(step.arguments, `micro macro step ${index}.arguments`))
+    };
+  });
+}
+
 function toolResult(value) {
   if (value && typeof value === "object" && !Array.isArray(value)
       && Array.isArray(value.content)) {
@@ -413,6 +508,7 @@ export class McpHarnessServer {
     this.configPath = path.resolve(configPath);
     this.manager = managerFactory(this.configPath);
     this.initialized = false;
+    this.microMacros = new Map();
   }
 
   #harness(args) {
@@ -485,6 +581,46 @@ export class McpHarnessServer {
           requireObject(args.params, "params"),
           optionalTimeout(args, "timeout_ms", harness.config.commandTimeoutMs)
         );
+      }
+      case "micro_macro_list": {
+        const macros = [...this.microMacros.values()]
+          .sort((a, b) => a.id.localeCompare(b.id))
+          .map((macro) => ({
+            id: macro.id,
+            stepCount: macro.steps.length,
+            totalWaitMs: macro.steps.reduce((sum, step) => sum + step.wait_ms, 0)
+          }));
+        return { total: macros.length, macros };
+      }
+      case "micro_macro_get": {
+        const id = microMacroId(args.id);
+        const macro = this.microMacros.get(id);
+        if (!macro) throw new Error(`micro macro not found: ${id}`);
+        return structuredClone(macro);
+      }
+      case "micro_macro_exec": {
+        const id = microMacroId(args.id);
+        if (args.steps !== undefined) {
+          this.microMacros.set(id, { id, steps: microMacroSteps(args.steps) });
+        }
+        const macro = this.microMacros.get(id);
+        if (!macro) throw new Error(`micro macro not found: ${id}; supply steps on the first exec`);
+        const inheritedIsolation = optionalExistingIsolation(args);
+        const results = [];
+        for (let index = 0; index < macro.steps.length; index += 1) {
+          const step = macro.steps[index];
+          if (step.wait_ms > 0) await sleep(step.wait_ms);
+          const stepArguments = structuredClone(step.arguments);
+          const definition = TOOLS.find((tool) => tool.name === step.tool);
+          if (inheritedIsolation !== undefined
+              && definition?.inputSchema?.properties?.isolation_id
+              && stepArguments.isolation_id === undefined) {
+            stepArguments.isolation_id = inheritedIsolation;
+          }
+          const result = await this.#callTool(step.tool, stepArguments);
+          results.push({ index, wait_ms: step.wait_ms, tool: step.tool, result });
+        }
+        return { ok: true, id, stepCount: macro.steps.length, results };
       }
       case "eval": {
         if (typeof args.script !== "string") throw new Error("script is required");
@@ -601,7 +737,7 @@ export class McpHarnessServer {
           title: "DeSmuME WebAssembly Harness",
           version: SERVER_VERSION
         },
-        instructions: "Use start_analyze only to create a new lane. Use list_instances then restart_analyze to reuse an existing Chrome window; restart_analyze may omit isolation_id only when exactly one lane exists. A Chrome window closed or crashed by the user is a dead session and is not automatically revived. load_state_file/load_save_file switch local files in an existing lane. export_state_file/export_save_file write under export_path without returning file bytes. list_commands is paged and names-only by default. analysis_context is bounded live browser/emulator state and does not depend on harness-tracked State/script paths. screenshot saves only the DeSmuME framebuffer to screenshot_path."
+        instructions: "Use start_analyze only to create a new lane. Use list_instances then restart_analyze to reuse an existing Chrome window; restart_analyze may omit isolation_id only when exactly one lane exists. A Chrome window closed or crashed by the user is a dead session and is not automatically revived. load_state_file/load_save_file switch local files in an existing lane. export_state_file/export_save_file write under export_path without returning file bytes. list_commands is paged and names-only by default. analysis_context is bounded live browser/emulator state and does not depend on harness-tracked State/script paths. micro_macro_exec can register and run a short wait+top-level-tool sequence under an AI-chosen id; micro_macro_list/get inspect stored definitions. screenshot saves only the DeSmuME framebuffer to screenshot_path."
       });
     }
     if (message.method === "ping") return response(id, {});

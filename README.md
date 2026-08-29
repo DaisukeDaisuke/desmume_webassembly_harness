@@ -53,9 +53,12 @@ tool_output_token_limit = 1000000
 - `pause`: エミュレータを停止する。
 - `resume`: エミュレータを再開する。
 - `call`: 任意のDeSmuME commandを呼ぶ。
+- `micro_macro_list`: このharnessプロセス内に登録済みのマイクロマクロID、step数、総wait時間を返す。
+- `micro_macro_get`: 指定IDのマイクロマクロJSONを返す。
+- `micro_macro_exec`: AIが決めたIDとsteps JSONを渡して登録/上書きし、その場で実行する。steps省略時は登録済みIDを再実行する。各stepは`wait_ms`待機後、`tool`で指定したharnessのトップレベルMCP toolを通常の単独呼び出しと同じhandler経路で呼ぶ。
 - `eval`: `desmume.eval` 相当のisolated JavaScriptを実行する。
 - `rerun_script`: UTF-8 JavaScriptファイルを読み、`desmume.runScript` 相当で実行する。
-- `rerun_pscript`: Persistent Scriptのsourceを読み込み、同名scriptがあれば停止してから直接 `runLoadedPersistentScript` を実行する。
+- `rerun_pscript`: Persistent Scriptのsourceをeditorへ読み込み、直接`runLoadedPersistentScript`を実行する。同名更新の停止・script-only trap解放はページ本体のupdate経路へ任せる。
 - `rerun_pscript_console`: Persistent Scriptを読み込み・起動し、そのscriptの最新 `print(...)` 出力まで1回のMCP callで返す。
 - `script_console`: 起動中Persistent Scriptの `script_id` を指定して最新 `print(...)` / `printf(...)` 出力だけをdirect `listScriptPrint` で取得する。
 - `stop_pscript`: Persistent Scriptを停止する。
@@ -72,6 +75,27 @@ tool_output_token_limit = 1000000
 `start_analyze`だけが新しいChrome laneを作成します。`status`、`call`、`analysis_context`、script操作、screenshotなど他のtoolへ存在しない`isolation_id`を渡してもChromeは作られずエラーになります。
 同じ`isolation_id`の`start_analyze`がすでに進行中の場合も、二重起動せず直ちにエラーにします。
 `start_analyze`以外は`isolation_id`を省略したとき既存laneが1個ならそれを使い、複数laneがある場合は明示指定を要求します。
+## マイクロマクロ
+`micro_macro_exec`はDeSmuMEページ内command専用のbatchではなく、`call`、`resume`、`rerun_pscript`、`call_pscript_mcp`、`load_state_file`などharnessが公開しているトップレベルMCP toolそのものを短い待機付き手順へまとめます。マクロはstdio MCPプロセス内メモリに保持され、AIが任意のIDを決めます。
+```json
+{
+  "id": "battle-turn-flow",
+  "isolation_id": "lane-a",
+  "steps": [
+    {
+      "wait_ms": 0,
+      "tool": "call_pscript_mcp",
+      "arguments": { "name": "queue_defend", "params": {} }
+    },
+    {
+      "wait_ms": 120,
+      "tool": "resume",
+      "arguments": {}
+    }
+  ]
+}
+```
+`wait_ms`はそのstepを呼ぶ直前の待機です。`micro_macro_exec`側へ`isolation_id`を指定すると、各stepの対象toolが`isolation_id`を受け取り、step自身に指定がない場合だけ継承します。stepに明示した`isolation_id`は上書きしません。初回は`steps`付きで登録・実行し、以後は`{ "id": "battle-turn-flow", "isolation_id": "lane-a" }`だけで同じ手順を再実行できます。`micro_macro_list`と`micro_macro_get`は実行せず保存内容だけを確認します。マイクロマクロから別の`micro_macro_*`を呼ぶ再帰実行は行いません。
 ## start_analyze
 新しい `isolation_id` では最初に `start_analyze` を呼びます。`state_path` と `save_path` は排他的で、必ずどちらか一方を指定します。既存laneの再利用は`restart_analyze`で行い、`start_analyze`へ既存`isolation_id`を渡すとエラーにします。
 ```text
