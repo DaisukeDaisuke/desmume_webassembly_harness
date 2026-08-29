@@ -522,6 +522,7 @@ export class McpHarnessServer {
     this.manager = managerFactory(this.configPath);
     this.initialized = false;
     this.microMacros = new Map();
+    this.microMacroExecutionSerial = 0;
   }
 
   #harness(args) {
@@ -619,19 +620,79 @@ export class McpHarnessServer {
         const macro = this.microMacros.get(id);
         if (!macro) throw new Error(`micro macro not found: ${id}; supply steps on the first exec`);
         const inheritedIsolation = optionalExistingIsolation(args);
-        const results = [];
-        for (let index = 0; index < macro.steps.length; index += 1) {
-          const step = macro.steps[index];
-          if (step.wait_ms > 0) await sleep(step.wait_ms);
-          const stepArguments = structuredClone(step.arguments);
+        this.microMacroExecutionSerial += 1;
+        const lockOwner = `micro-macro:${id}:${this.microMacroExecutionSerial}`;
+        const lockedHarnesses = new Set();
+        const lockHarness = async (harness) => {
+          if (lockedHarnesses.has(harness)) return;
+          await harness.setUiInteractionLock(lockOwner, true);
+          lockedHarnesses.add(harness);
+        };
+        const releaseHarness = async (harness) => {
+          if (!lockedHarnesses.has(harness)) return;
+          await harness.setUiInteractionLock(lockOwner, false);
+          lockedHarnesses.delete(harness);
+        };
+        const ensureUiLocked = async (step, stepArguments) => {
           const definition = TOOLS.find((tool) => tool.name === step.tool);
-          if (inheritedIsolation !== undefined
-              && definition?.inputSchema?.properties?.isolation_id
-              && stepArguments.isolation_id === undefined) {
-            stepArguments.isolation_id = inheritedIsolation;
+          if (!definition?.inputSchema?.properties?.isolation_id || step.tool === "start_analyze") return;
+          const isolationId = stepArguments.isolation_id;
+          const harness = this.manager.requireExisting(isolationId);
+          await lockHarness(harness);
+        };
+        const results = [];
+        let executionError = null;
+        try {
+          if (!macro.steps.some((step) => step.tool === "start_analyze")) {
+            const targetIds = new Set();
+            let needsImplicitTarget = false;
+            for (const step of macro.steps) {
+              const definition = TOOLS.find((tool) => tool.name === step.tool);
+              if (!definition?.inputSchema?.properties?.isolation_id) continue;
+              const targetId = step.arguments.isolation_id ?? inheritedIsolation;
+              if (targetId === undefined) needsImplicitTarget = true;
+              else targetIds.add(targetId);
+            }
+            for (const targetId of targetIds) await lockHarness(this.manager.requireExisting(targetId));
+            if (needsImplicitTarget) await lockHarness(this.manager.requireExisting(undefined));
           }
-          const result = await this.#callTool(step.tool, stepArguments);
-          results.push({ index, wait_ms: step.wait_ms, tool: step.tool, result });
+          for (let index = 0; index < macro.steps.length; index += 1) {
+            const step = macro.steps[index];
+            const stepArguments = structuredClone(step.arguments);
+            const definition = TOOLS.find((tool) => tool.name === step.tool);
+            if (inheritedIsolation !== undefined
+                && definition?.inputSchema?.properties?.isolation_id
+                && stepArguments.isolation_id === undefined) {
+              stepArguments.isolation_id = inheritedIsolation;
+            }
+            await ensureUiLocked(step, stepArguments);
+            if (step.wait_ms > 0) await sleep(step.wait_ms);
+            if (step.tool === "close_instance") {
+              await releaseHarness(this.manager.requireExisting(stepArguments.isolation_id));
+            } else if (step.tool === "close_all_sessions") {
+              for (const harness of [...lockedHarnesses]) await releaseHarness(harness);
+            }
+            const result = await this.#callTool(step.tool, stepArguments);
+            results.push({ index, wait_ms: step.wait_ms, tool: step.tool, result });
+            if (step.tool === "start_analyze") {
+              const createdIsolation = optionalIsolation(stepArguments);
+              const harness = this.manager.requireExisting(createdIsolation);
+              await lockHarness(harness);
+            }
+          }
+        } catch (error) {
+          executionError = error;
+          throw error;
+        } finally {
+          const releaseErrors = [];
+          for (const harness of [...lockedHarnesses].reverse()) {
+            try {
+              await harness.setUiInteractionLock(lockOwner, false);
+            } catch (error) {
+              releaseErrors.push(error);
+            }
+          }
+          if (!executionError && releaseErrors.length > 0) throw releaseErrors[0];
         }
         return { ok: true, id, stepCount: macro.steps.length, results };
       }

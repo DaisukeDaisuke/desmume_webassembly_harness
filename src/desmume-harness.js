@@ -87,6 +87,13 @@ export class DesmumeHarness {
     return requireOk(await this.#directCall("status"), "status");
   }
 
+  async setUiInteractionLock(owner, locked) {
+    return requireOk(
+      await this.#directCall("setUiInteractionLock", { owner, locked }),
+      "setUiInteractionLock"
+    );
+  }
+
   async pause() {
     return await this.call("pause");
   }

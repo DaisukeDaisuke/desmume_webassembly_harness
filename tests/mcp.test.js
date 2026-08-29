@@ -329,7 +329,12 @@ test("micro macro tool resolution exhaustively accepts namespaced top-level tool
 test("micro macros register namespaced top-level MCP calls, list/get them, and re-execute by id", async () => {
   const calls = [];
   const harness = {
+    isolationId: "lane-a",
     config: { commandTimeoutMs: 600000, baselineName: "base", replaceBaseline: true },
+    async setUiInteractionLock(owner, locked) {
+      calls.push({ uiLock: { owner, locked } });
+      return { ok: true, locked };
+    },
     async resume() {
       calls.push("resume");
       return { ok: true, running: true, paused: false };
@@ -366,8 +371,10 @@ test("micro macros register namespaced top-level MCP calls, list/get them, and r
   assert.equal(first.result.structuredContent.id, "turn-flow");
   assert.equal(first.result.structuredContent.stepCount, 2);
   assert.deepEqual(calls, [
+    { uiLock: { owner: "micro-macro:turn-flow:1", locked: true } },
     { command: "pressButtons", params: { buttons: ["A"] } },
-    "resume"
+    "resume",
+    { uiLock: { owner: "micro-macro:turn-flow:1", locked: false } }
   ]);
 
   const listed = await server.handle({
@@ -395,7 +402,82 @@ test("micro macros register namespaced top-level MCP calls, list/get them, and r
     method: "tools/call",
     params: { name: "micro_macro_exec", arguments: { id: "turn-flow", isolation_id: "lane-a" } }
   });
-  assert.equal(calls.length, 4);
+  assert.deepEqual(calls.slice(4), [
+    { uiLock: { owner: "micro-macro:turn-flow:2", locked: true } },
+    { command: "pressButtons", params: { buttons: ["A"] } },
+    "resume",
+    { uiLock: { owner: "micro-macro:turn-flow:2", locked: false } }
+  ]);
+});
+
+test("micro macro UI lock is released on failure and intentional pause remains a normal step", async () => {
+  const calls = [];
+  const harness = {
+    isolationId: "lane-a",
+    config: { commandTimeoutMs: 600000 },
+    async setUiInteractionLock(owner, locked) {
+      calls.push(`lock:${owner}:${locked}`);
+      return { ok: true, locked };
+    },
+    async pause() {
+      calls.push("pause");
+      return { ok: true, paused: true, running: false };
+    },
+    async call() {
+      calls.push("failing-call");
+      throw new Error("step failed");
+    }
+  };
+  const server = new McpHarnessServer({
+    configPath: "harness.toml",
+    managerFactory: () => ({
+      requireExisting(id) {
+        assert.equal(id, "lane-a");
+        return harness;
+      },
+      async closeAll() {}
+    })
+  });
+  const paused = await server.handle({
+    jsonrpc: "2.0",
+    id: 46,
+    method: "tools/call",
+    params: {
+      name: "micro_macro_exec",
+      arguments: {
+        id: "intentional-pause",
+        isolation_id: "lane-a",
+        steps: [{ tool: "desmume_harness__pause", arguments: {} }]
+      }
+    }
+  });
+  assert.equal(paused.result.isError, false);
+  assert.deepEqual(calls, [
+    "lock:micro-macro:intentional-pause:1:true",
+    "pause",
+    "lock:micro-macro:intentional-pause:1:false"
+  ]);
+  calls.length = 0;
+  const failed = await server.handle({
+    jsonrpc: "2.0",
+    id: 47,
+    method: "tools/call",
+    params: {
+      name: "micro_macro_exec",
+      arguments: {
+        id: "failing-step",
+        isolation_id: "lane-a",
+        steps: [{ tool: "desmume_harness__call", arguments: { command: "boom" } }]
+      }
+    }
+  });
+  assert.equal(failed.result.isError, true);
+  assert.match(failed.result.content[0].text, /step failed/u);
+  assert.deepEqual(calls, [
+    "lock:micro-macro:failing-step:2:true",
+    "failing-call",
+    "lock:micro-macro:failing-step:2:false"
+  ]);
 });
 
 test("micro macros reject recursive macro execution and unknown top-level tools", async () => {
