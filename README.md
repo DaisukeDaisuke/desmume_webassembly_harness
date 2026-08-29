@@ -95,7 +95,7 @@ tool_output_token_limit = 1000000
   ]
 }
 ```
-`wait_ms`はそのstepを呼ぶ直前の待機です。`micro_macro_exec`側へ`isolation_id`を指定すると、各stepの対象toolが`isolation_id`を受け取り、step自身に指定がない場合だけ継承します。stepに明示した`isolation_id`は上書きしません。初回は`steps`付きで登録・実行し、以後は`{ "id": "battle-turn-flow", "isolation_id": "lane-a" }`だけで同じ手順を再実行できます。`micro_macro_list`と`micro_macro_get`は実行せず保存内容だけを確認します。マイクロマクロから別の`micro_macro_*`を呼ぶ再帰実行は行いません。
+`wait_ms`はそのstepを呼ぶ直前の待機です。`tool`は内部名の`resume`/`call_pscript_mcp`だけでなく、AIから実際に見える`desmume_harness__resume`/`desmume_harness__call_pscript_mcp`形式も受け付けます。解決時はharnessの`TOOLS`一覧を総当たりし、完全一致を優先したうえで`__<tool name>`の後方一致を一意に解決して内部名へ正規化します。`micro_macro_exec`側へ`isolation_id`を指定すると、各stepの対象toolが`isolation_id`を受け取り、step自身に指定がない場合だけ継承します。stepに明示した`isolation_id`は上書きしません。初回は`steps`付きで登録・実行し、以後は`{ "id": "battle-turn-flow", "isolation_id": "lane-a" }`だけで同じ手順を再実行できます。`micro_macro_list`と`micro_macro_get`は実行せず保存内容だけを確認します。マイクロマクロから別の`micro_macro_*`を呼ぶ再帰実行は行いません。
 ## start_analyze
 新しい `isolation_id` では最初に `start_analyze` を呼びます。`state_path` と `save_path` は排他的で、必ずどちらか一方を指定します。既存laneの再利用は`restart_analyze`で行い、`start_analyze`へ既存`isolation_id`を渡すとエラーにします。
 ```text

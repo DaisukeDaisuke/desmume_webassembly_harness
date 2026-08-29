@@ -63,7 +63,7 @@ const microMacroStepSchema = objectSchema({
   tool: {
     type: "string",
     minLength: 1,
-    description: "Top-level desmume_harness MCP tool name to invoke through its normal handler."
+    description: "Top-level desmume_harness MCP tool name to invoke through its normal handler. Full externally visible names such as desmume_harness__resume are accepted and resolved by unique tool-list suffix match."
   },
   arguments: {
     type: "object",
@@ -197,7 +197,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: "micro_macro_exec",
-    description: "Register/replace and execute an AI-named micro macro, or execute a previously registered id. Each step waits wait_ms, then invokes the named top-level MCP tool through the same normal handler used for an individual tools/call request.",
+    description: "Register/replace and execute an AI-named micro macro, or execute a previously registered id. Each step waits wait_ms, resolves the supplied top-level MCP tool name (including externally namespaced names) by the harness tool list, then invokes its normal individual tools/call handler.",
     inputSchema: objectSchema({
       id: microMacroIdProperty,
       isolation_id: isolationProperty,
@@ -434,6 +434,28 @@ function microMacroId(value) {
   return value;
 }
 
+function resolveMicroMacroToolName(value, index = 0) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`micro macro step ${index}.tool must be a non-empty string`);
+  }
+  const requested = value.trim();
+  let matches = TOOLS.filter((candidate) => candidate.name === requested);
+  if (matches.length === 0) {
+    matches = TOOLS.filter((candidate) => requested.endsWith(`__${candidate.name}`));
+  }
+  if (matches.length === 0) {
+    throw new Error(`micro macro step ${index} references unknown top-level tool ${requested}`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`micro macro step ${index} top-level tool ${requested} is ambiguous`);
+  }
+  const tool = matches[0].name;
+  if (tool.startsWith("micro_macro_")) {
+    throw new Error(`micro macro step ${index} cannot invoke another micro_macro tool`);
+  }
+  return tool;
+}
+
 function microMacroSteps(value) {
   if (!Array.isArray(value) || value.length < 1 || value.length > 128) {
     throw new Error("micro macro steps must contain from 1 through 128 steps");
@@ -447,16 +469,7 @@ function microMacroSteps(value) {
     if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 600000) {
       throw new Error(`micro macro step ${index}.wait_ms must be an integer from 0 through 600000`);
     }
-    if (typeof step.tool !== "string" || !step.tool.trim()) {
-      throw new Error(`micro macro step ${index}.tool must be a non-empty string`);
-    }
-    const tool = step.tool.trim();
-    if (tool.startsWith("micro_macro_")) {
-      throw new Error(`micro macro step ${index} cannot invoke another micro_macro tool`);
-    }
-    if (!TOOLS.some((candidate) => candidate.name === tool)) {
-      throw new Error(`micro macro step ${index} references unknown top-level tool ${tool}`);
-    }
+    const tool = resolveMicroMacroToolName(step.tool, index);
     return {
       wait_ms: waitMs,
       tool,
@@ -813,4 +826,4 @@ if (executedDirectly) {
   });
 }
 
-export { TOOLS, SUPPORTED_PROTOCOLS };
+export { TOOLS, SUPPORTED_PROTOCOLS, resolveMicroMacroToolName };

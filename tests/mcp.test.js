@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { normalizeWebMcpExecution } from "../src/chrome-session.js";
-import { McpHarnessServer } from "../src/mcpMain.js";
+import { McpHarnessServer, TOOLS, resolveMicroMacroToolName } from "../src/mcpMain.js";
 
 test("WebMCP execution transport wrapper is removed before harness results escape", () => {
   const output = { ok: true, paused: true, running: false };
@@ -311,7 +311,22 @@ test("script_console routes a bounded direct console read by script id", async (
   assert.equal(reply.result.structuredContent.logs[0].text, "ready");
 });
 
-test("micro macros register top-level MCP calls, list/get them, and re-execute by id", async () => {
+test("micro macro tool resolution exhaustively accepts namespaced top-level tools by suffix", () => {
+  for (const tool of TOOLS) {
+    if (tool.name.startsWith("micro_macro_")) {
+      assert.throws(
+        () => resolveMicroMacroToolName(`desmume_harness__${tool.name}`, 0),
+        /cannot invoke another micro_macro tool/u
+      );
+      continue;
+    }
+    assert.equal(resolveMicroMacroToolName(tool.name, 0), tool.name);
+    assert.equal(resolveMicroMacroToolName(`desmume_harness__${tool.name}`, 0), tool.name);
+    assert.equal(resolveMicroMacroToolName(`any_gateway_prefix__${tool.name}`, 0), tool.name);
+  }
+});
+
+test("micro macros register namespaced top-level MCP calls, list/get them, and re-execute by id", async () => {
   const calls = [];
   const harness = {
     config: { commandTimeoutMs: 600000, baselineName: "base", replaceBaseline: true },
@@ -342,8 +357,8 @@ test("micro macros register top-level MCP calls, list/get them, and re-execute b
         id: "turn-flow",
         isolation_id: "lane-a",
         steps: [
-          { wait_ms: 0, tool: "call", arguments: { command: "pressButtons", params: { buttons: ["A"] } } },
-          { wait_ms: 1, tool: "resume", arguments: {} }
+          { wait_ms: 0, tool: "desmume_harness__call", arguments: { command: "pressButtons", params: { buttons: ["A"] } } },
+          { wait_ms: 1, tool: "desmume_harness__resume", arguments: {} }
         ]
       }
     }
