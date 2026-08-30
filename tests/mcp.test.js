@@ -4,7 +4,12 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { normalizeWebMcpExecution } from "../src/chrome-session.js";
-import { McpHarnessServer, TOOLS, resolveMicroMacroToolName } from "../src/mcpMain.js";
+import {
+  inheritMicroMacroIsolation,
+  McpHarnessServer,
+  TOOLS,
+  resolveMicroMacroToolName
+} from "../src/mcpMain.js";
 
 test("WebMCP execution transport wrapper is removed before harness results escape", () => {
   const output = { ok: true, paused: true, running: false };
@@ -323,6 +328,24 @@ test("micro macro tool resolution exhaustively accepts namespaced top-level tool
     assert.equal(resolveMicroMacroToolName(tool.name, 0), tool.name);
     assert.equal(resolveMicroMacroToolName(`desmume_harness__${tool.name}`, 0), tool.name);
     assert.equal(resolveMicroMacroToolName(`any_gateway_prefix__${tool.name}`, 0), tool.name);
+  }
+});
+
+test("micro macro root isolation exhaustively inherits only into isolation-aware tools and never overrides a step", () => {
+  for (const tool of TOOLS) {
+    const acceptsIsolation = Boolean(tool.inputSchema?.properties?.isolation_id);
+    const inherited = inheritMicroMacroIsolation(tool.name, { marker: true }, "root-lane");
+    assert.equal(
+      inherited.isolation_id,
+      acceptsIsolation ? "root-lane" : undefined,
+      `${tool.name} root isolation inheritance`
+    );
+    const explicit = inheritMicroMacroIsolation(
+      tool.name,
+      { isolation_id: "step-lane", marker: true },
+      "root-lane"
+    );
+    assert.equal(explicit.isolation_id, "step-lane", `${tool.name} explicit step isolation wins`);
   }
 });
 

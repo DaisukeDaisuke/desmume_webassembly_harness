@@ -197,7 +197,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: "micro_macro_exec",
-    description: "Register/replace and execute an AI-named micro macro, or execute a previously registered id. Each step waits wait_ms, resolves the supplied top-level MCP tool name (including externally namespaced names) by the harness tool list, then invokes its normal individual tools/call handler.",
+    description: "Register/replace and execute an AI-named micro macro, or execute a previously registered id. Root isolation_id is inherited by every step whose target tool accepts isolation_id, unless that step already specifies its own isolation_id. Each step waits wait_ms, resolves the supplied top-level MCP tool name (including externally namespaced names) by the harness tool list, then invokes its normal individual tools/call handler.",
     inputSchema: objectSchema({
       id: microMacroIdProperty,
       isolation_id: isolationProperty,
@@ -478,6 +478,16 @@ function microMacroSteps(value) {
   });
 }
 
+export function inheritMicroMacroIsolation(toolName, stepArguments, inheritedIsolation) {
+  const definition = TOOLS.find((tool) => tool.name === toolName);
+  if (inheritedIsolation !== undefined
+      && definition?.inputSchema?.properties?.isolation_id
+      && stepArguments.isolation_id === undefined) {
+    stepArguments.isolation_id = inheritedIsolation;
+  }
+  return stepArguments;
+}
+
 function toolResult(value) {
   if (value && typeof value === "object" && !Array.isArray(value)
       && Array.isArray(value.content)) {
@@ -658,13 +668,11 @@ export class McpHarnessServer {
           }
           for (let index = 0; index < macro.steps.length; index += 1) {
             const step = macro.steps[index];
-            const stepArguments = structuredClone(step.arguments);
-            const definition = TOOLS.find((tool) => tool.name === step.tool);
-            if (inheritedIsolation !== undefined
-                && definition?.inputSchema?.properties?.isolation_id
-                && stepArguments.isolation_id === undefined) {
-              stepArguments.isolation_id = inheritedIsolation;
-            }
+            const stepArguments = inheritMicroMacroIsolation(
+              step.tool,
+              structuredClone(step.arguments),
+              inheritedIsolation
+            );
             await ensureUiLocked(step, stepArguments);
             if (step.wait_ms > 0) await sleep(step.wait_ms);
             if (step.tool === "close_instance") {
