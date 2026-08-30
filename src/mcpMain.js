@@ -44,6 +44,20 @@ const timeoutProperty = {
   description: "Operation timeout in milliseconds."
 };
 
+const analysisScriptsProperty = {
+  type: "array",
+  maxItems: 8,
+  items: { type: "string", minLength: 1 },
+  description: "Absolute paths of up to 8 UTF-8 .js persistent scripts to start concurrently after the baseline is saved."
+};
+
+const consoleReadProperties = {
+  start_line: { type: "integer", minimum: 1, description: "First console line to return. Omit to start at the first unread line." },
+  max: { type: "integer", minimum: 1, maximum: 1000, default: 20 },
+  mark_read: { type: "boolean", default: false, description: "Advance the unread cursor through the last returned line." },
+  clear: { type: "boolean", default: false, description: "Clear the emulator console after determining this result." }
+};
+
 const microMacroIdProperty = {
   type: "string",
   minLength: 1,
@@ -74,11 +88,12 @@ const microMacroStepSchema = objectSchema({
 const TOOLS = Object.freeze([
   {
     name: "start_analyze",
-    description: "Create a new Chrome/DeSmuME lane, load ROM plus one State/Save, save the analysis baseline, and return compact run state. If the lane already exists, use restart_analyze.",
+    description: "Create a new Chrome/DeSmuME lane, load ROM plus one State/Save, save the analysis baseline, and return compact run state. If a healthy lane already exists, use restart_analyze. A runFrame-native-faulted lane with the same id is discarded and recreated fresh.",
     inputSchema: objectSchema({
       isolation_id: startIsolationProperty,
       state_path: { type: "string", minLength: 1, description: "Local State file to load for this analysis start." },
-      save_path: { type: "string", minLength: 1, description: "Local .sav/.dsv file to load instead of a State." }
+      save_path: { type: "string", minLength: 1, description: "Local .sav/.dsv file to load instead of a State." },
+      scripts: analysisScriptsProperty
     }, [])
   },
   {
@@ -87,7 +102,8 @@ const TOOLS = Object.freeze([
     inputSchema: objectSchema({
       isolation_id: existingIsolationProperty,
       state_path: { type: "string", minLength: 1 },
-      save_path: { type: "string", minLength: 1 }
+      save_path: { type: "string", minLength: 1 },
+      scripts: analysisScriptsProperty
     })
   },
   {
@@ -252,18 +268,33 @@ const TOOLS = Object.freeze([
       wait_for_registration: { type: "boolean", default: true },
       startup_timeout_ms: timeoutProperty,
       timeout_ms: timeoutProperty,
-      max: { type: "integer", minimum: 1, maximum: 1000, default: 20 }
+      ...consoleReadProperties
     }, ["path"])
   },
   {
     name: "script_console",
-    description: "Return the latest print/printf console lines for one running persistent script through direct listScriptPrint.",
-    inputSchema: objectSchema({
-      isolation_id: isolationProperty,
-      script_id: { type: "integer", minimum: 1 },
-      max: { type: "integer", minimum: 1, maximum: 1000, default: 20 }
-    }, ["script_id"]),
-    annotations: { readOnlyHint: true }
+    description: "Return line-numbered print/printf console output for one persistent script selected by script_id or name.",
+    inputSchema: {
+      ...objectSchema({
+        isolation_id: isolationProperty,
+        script_id: { type: "integer", minimum: 1 },
+        name: { type: "string", minLength: 1, maxLength: 64 },
+        ...consoleReadProperties
+      }),
+      oneOf: [{ required: ["script_id"] }, { required: ["name"] }]
+    }
+  },
+  {
+    name: "clear_script_console",
+    description: "Clear one persistent-script console selected by script_id or name, or every console when both selectors are omitted, and synchronize unread cursors.",
+    inputSchema: {
+      ...objectSchema({
+        isolation_id: isolationProperty,
+        script_id: { type: "integer", minimum: 1 },
+        name: { type: "string", minLength: 1, maxLength: 64 }
+      }),
+      not: { required: ["script_id", "name"] }
+    }
   },
   {
     name: "stop_pscript",
@@ -414,6 +445,41 @@ function optionalTimeout(args, key, fallback) {
   return value;
 }
 
+function optionalAnalysisScripts(args) {
+  if (args.scripts === undefined) return undefined;
+  if (!Array.isArray(args.scripts) || args.scripts.length > 8) {
+    throw new Error("scripts must be an array containing at most 8 files");
+  }
+  return args.scripts.map((filePath, index) => {
+    if (typeof filePath !== "string" || !path.isAbsolute(filePath)) {
+      throw new Error(`scripts[${index}] must be an absolute path`);
+    }
+    if (path.extname(filePath).toLowerCase() !== ".js") {
+      throw new Error(`scripts[${index}] must have a .js extension`);
+    }
+    return filePath;
+  });
+}
+
+function consoleReadOptions(args) {
+  const max = args.max === undefined ? 20 : Number(args.max);
+  if (!Number.isSafeInteger(max) || max < 1 || max > 1000) {
+    throw new Error("max must be an integer from 1 through 1000");
+  }
+  const startLine = args.start_line === undefined ? undefined : Number(args.start_line);
+  if (startLine !== undefined && (!Number.isSafeInteger(startLine) || startLine < 1)) {
+    throw new Error("start_line must be a positive integer");
+  }
+  if (args.mark_read !== undefined && typeof args.mark_read !== "boolean") throw new Error("mark_read must be boolean");
+  if (args.clear !== undefined && typeof args.clear !== "boolean") throw new Error("clear must be boolean");
+  return {
+    startLine,
+    max,
+    markRead: args.mark_read ?? false,
+    clear: args.clear ?? false
+  };
+}
+
 function scriptSelector(args) {
   const hasId = args.script_id !== undefined;
   const hasName = args.name !== undefined;
@@ -554,7 +620,8 @@ export class McpHarnessServer {
         if (args.save_path !== undefined && (typeof args.save_path !== "string" || !args.save_path.trim())) throw new Error("save_path must be a non-empty string");
         return await this.manager.startAnalyze(optionalIsolation(args), {
           statePath: args.state_path,
-          savePath: args.save_path
+          savePath: args.save_path,
+          ...(args.scripts === undefined ? {} : { scripts: optionalAnalysisScripts(args) })
         });
       case "restart_analyze":
         if ((args.state_path === undefined) === (args.save_path === undefined)) {
@@ -564,7 +631,8 @@ export class McpHarnessServer {
         if (args.save_path !== undefined && (typeof args.save_path !== "string" || !args.save_path.trim())) throw new Error("save_path must be a non-empty string");
         return await this.manager.restartAnalyze(optionalExistingIsolation(args), {
           statePath: args.state_path,
-          savePath: args.save_path
+          savePath: args.save_path,
+          ...(args.scripts === undefined ? {} : { scripts: optionalAnalysisScripts(args) })
         });
       case "list_instances":
         return this.manager.listInstances();
@@ -645,7 +713,9 @@ export class McpHarnessServer {
         };
         const ensureUiLocked = async (step, stepArguments) => {
           const definition = TOOLS.find((tool) => tool.name === step.tool);
-          if (!definition?.inputSchema?.properties?.isolation_id || step.tool === "start_analyze") return;
+          if (!definition?.inputSchema?.properties?.isolation_id
+              || step.tool === "start_analyze"
+              || step.tool === "close_instance") return;
           const isolationId = stepArguments.isolation_id;
           const harness = this.manager.requireExisting(isolationId);
           await lockHarness(harness);
@@ -657,6 +727,7 @@ export class McpHarnessServer {
             const targetIds = new Set();
             let needsImplicitTarget = false;
             for (const step of macro.steps) {
+              if (step.tool === "close_instance" || step.tool === "close_all_sessions") continue;
               const definition = TOOLS.find((tool) => tool.name === step.tool);
               if (!definition?.inputSchema?.properties?.isolation_id) continue;
               const targetId = step.arguments.isolation_id ?? inheritedIsolation;
@@ -676,7 +747,7 @@ export class McpHarnessServer {
             await ensureUiLocked(step, stepArguments);
             if (step.wait_ms > 0) await sleep(step.wait_ms);
             if (step.tool === "close_instance") {
-              await releaseHarness(this.manager.requireExisting(stepArguments.isolation_id));
+              await releaseHarness(this.manager.requireExistingForClose(stepArguments.isolation_id));
             } else if (step.tool === "close_all_sessions") {
               for (const harness of [...lockedHarnesses]) await releaseHarness(harness);
             }
@@ -731,8 +802,7 @@ export class McpHarnessServer {
       case "rerun_pscript_console": {
         if (typeof args.path !== "string" || !args.path.trim()) throw new Error("path is required");
         const harness = await this.#harness(args);
-        const max = args.max === undefined ? 20 : Number(args.max);
-        if (!Number.isSafeInteger(max) || max < 1 || max > 1000) throw new Error("max must be an integer from 1 through 1000");
+        const consoleOptions = consoleReadOptions(args);
         return await harness.rerunPScriptConsole(
           args.path,
           args.async_mode ?? false,
@@ -741,16 +811,18 @@ export class McpHarnessServer {
             waitForRegistration: args.wait_for_registration ?? true,
             startupTimeoutMs: optionalTimeout(args, "startup_timeout_ms", 10000),
             timeoutMs: optionalTimeout(args, "timeout_ms", harness.config.commandTimeoutMs),
-            max
+            ...consoleOptions
           }
         );
       }
       case "script_console": {
-        const scriptId = Number(args.script_id);
-        if (!Number.isSafeInteger(scriptId) || scriptId < 1) throw new Error("script_id must be a positive integer");
-        const max = args.max === undefined ? 20 : Number(args.max);
-        if (!Number.isSafeInteger(max) || max < 1 || max > 1000) throw new Error("max must be an integer from 1 through 1000");
-        return await (await this.#harness(args)).scriptConsole(scriptId, max);
+        return await (await this.#harness(args)).scriptConsole(scriptSelector(args), consoleReadOptions(args));
+      }
+      case "clear_script_console": {
+        const hasId = args.script_id !== undefined;
+        const hasName = args.name !== undefined;
+        if (hasId && hasName) throw new Error("specify either script_id or name, not both");
+        return await (await this.#harness(args)).clearScriptConsole(hasId || hasName ? scriptSelector(args) : undefined);
       }
       case "stop_pscript":
         return await (await this.#harness(args)).stopPscript(scriptSelector(args));
@@ -787,7 +859,7 @@ export class McpHarnessServer {
         return await (await this.#harness(args)).injectBytesFile(args.file_path, args.address, args.cpu);
       }
       case "close_instance": {
-        const harness = this.manager.requireExisting(optionalExistingIsolation(args));
+        const harness = this.manager.requireExistingForClose(optionalExistingIsolation(args));
         return { closed: await this.manager.close(harness.isolationId) };
       }
       case "close_all_sessions":

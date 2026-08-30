@@ -39,8 +39,8 @@ tool_timeout_sec = 600
 tool_output_token_limit = 1000000
 ```
 ## Codexから見えるMCP tools
-- `start_analyze`: 新しいlane専用。`state_path` または `save_path` のどちらか一方を受け、Chrome起動、ROM読込、State/Save読込、analysis baseline作成まで行う。既存laneには使用せず`restart_analyze`を使う。初回起動失敗だけはfresh Chromeから最大3回まで再試行する。
-- `restart_analyze`: 既存laneのChromeウインドウを使い回し、State/Saveを差し替えてanalysis baselineを作り直す。`isolation_id`省略は既存laneが1個だけの場合に限る。閉じられた／クラッシュしたChromeは復活させない。
+- `start_analyze`: 新しいlane専用。`state_path` または `save_path` のどちらか一方を受け、Chrome起動、ROM読込、State/Save読込、analysis baseline作成後、任意の`scripts`（絶対パスのUTF-8 `.js`、最大8件）を並列起動して全登録結果が確定するまで待つ。既存laneには使用せず`restart_analyze`を使う。初回起動失敗だけはfresh Chromeから最大3回まで再試行する。
+- `restart_analyze`: 既存laneのChromeウインドウを使い回し、State/Saveを差し替えてanalysis baselineを作り直した後、任意の`scripts`を並列起動する。`isolation_id`省略は既存laneが1個だけの場合に限る。閉じられた／クラッシュしたChromeは復活させない。
 - `list_instances`: 現在MCPプロセスが保持しているlaneとalive/dead状態を最大64件返す。Chromeを新規作成しない。
 - `list_commands`: 実行中ページの`DesmumeMCP.list()`を読む。既定は名前だけ64件、最大64件でページングし、description要求時も各160文字までに制限して巨大なAPI一覧を一度に返さない。
 - `load_state_file`: 既存laneへローカルStateを投入する。新しいChromeは作らない。
@@ -60,7 +60,8 @@ tool_output_token_limit = 1000000
 - `rerun_script`: UTF-8 JavaScriptファイルを読み、`desmume.runScript` 相当で実行する。
 - `rerun_pscript`: Persistent Scriptのsourceをeditorへ読み込み、直接`runLoadedPersistentScript`を実行する。同名更新の停止・script-only trap解放はページ本体のupdate経路へ任せる。
 - `rerun_pscript_console`: Persistent Scriptを読み込み・起動し、そのscriptの最新 `print(...)` 出力まで1回のMCP callで返す。
-- `script_console`: 起動中Persistent Scriptの `script_id` を指定して最新 `print(...)` / `printf(...)` 出力だけをdirect `listScriptPrint` で取得する。
+- `script_console`: Persistent Scriptを `script_id` または `name` で指定し、行番号付きの未読 `print(...)` / `printf(...)` 出力を取得する。部分取得、明示的既読化、取得後クリアに対応する。
+- `clear_script_console`: `script_id` または `name` で指定したconsoleを消去する。両方省略すると全consoleを消去する。
 - `stop_pscript`: Persistent Scriptを停止する。
 - `restart_pscript`: Persistent Scriptを再起動する。
 - `snapshot_elements`: 現在の操作要素と位置を取得する。
@@ -75,7 +76,7 @@ tool_output_token_limit = 1000000
 `start_analyze`だけが新しいChrome laneを作成します。`status`、`call`、`analysis_context`、script操作、screenshotなど他のtoolへ存在しない`isolation_id`を渡してもChromeは作られずエラーになります。
 同じ`isolation_id`の`start_analyze`がすでに進行中の場合も、二重起動せず直ちにエラーにします。
 `start_analyze`以外は`isolation_id`を省略したとき既存laneが1個ならそれを使い、複数laneがある場合は明示指定を要求します。
-既存laneで`NATIVE_FAULT`の`runFrame`が観測された場合、そのlaneはharness側で使用不能として固定され、それ以降のlane操作は直ちにエラーになります。復旧入口は`start_analyze`だけで、同じ`isolation_id`へ`start_analyze`した場合もfault済みChromeを閉じてfresh laneを作成します。macro実行中にfaultした場合も次stepへ進まず、UI interaction lockの解除だけは内部cleanupとして実行します。
+既存laneで`NATIVE_FAULT`の`runFrame`が観測された場合、そのlaneはharness側で使用不能として固定され、それ以降の通常lane操作は直ちにエラーになります。例外は`start_analyze`、`close_instance`、`close_all_sessions`です。`start_analyze`を同じ`isolation_id`へ呼ぶとfault済みChromeを閉じてfresh laneを作成し、close系はfault済みlaneをそのまま破棄できます。macro実行中にfaultした場合も次stepへ進まず、UI interaction lockの解除だけは内部cleanupとして実行します。
 ## マイクロマクロ
 `micro_macro_exec`はDeSmuMEページ内command専用のbatchではなく、`call`、`resume`、`rerun_pscript`、`call_pscript_mcp`、`load_state_file`などharnessが公開しているトップレベルMCP toolそのものを短い待機付き手順へまとめます。マクロはstdio MCPプロセス内メモリに保持され、AIが任意のIDを決めます。
 ```json
@@ -122,7 +123,7 @@ start_analyze { isolation_id: "lane-a", state_path: "C:\\dq9\\states\\battle-a.d
 ## Persistent Scriptの最短console取得
 `overlay_jp.js` のように `print(...)` を使うPersistent Scriptでは、`rerun_pscript_console` を使うとローカルsource読込、direct `runPersistentScript`、direct `listScriptPrint` を1回のstdio MCP callにまとめられます。Persistent Scripts editorや巨大なUI snapshotは経由しません。
 
-以後のconsole取得は `analysis_context` に出る `script_id` を `script_console` に渡せば、scriptを再実行せずdirect `listScriptPrint` 1回だけで取得できます。
+以後のconsole取得は `analysis_context` に出るscriptの `id` または `name` を `script_console` に渡せば、scriptを再実行せず差分だけを取得できます。既読位置を進める場合は `mark_read:true`、取得結果確定後に消去する場合は `clear:true` を指定します。
 ## 複数エミュレータ
 すべての主要toolは `isolation_id` を受け取ります。異なる `isolation_id` は別Chrome profileと別DevTools portを使用するため、同じstdio MCPプロセスから複数DeSmuMEを同時に保持できます。
 ```text

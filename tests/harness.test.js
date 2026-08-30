@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { preprocessAssemblySource } from "../src/armv5t-assembly-preprocessor.js";
@@ -83,6 +83,98 @@ test("startAnalyze loads ROM and State, saves the baseline, and returns only com
   assert.equal(fake.events.some((event) => event.startsWith("snapshot:")), false);
   assert.equal(fake.events.includes("mcp:snapshotContext"), false);
   assert.equal(fake.events.includes("mcp:stepFrames"), false);
+});
+
+test("startAnalyze launches scripts concurrently after baseline and waits through one failed-only retry", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "desmume-analyze-scripts-"));
+  const paths = ["ready.js", "retry.js", "broken.js"].map((name) => path.join(directory, name));
+  await Promise.all(paths.map((filePath, index) => writeFile(filePath, `script-${index}`, "utf8")));
+  let releaseRegistration;
+  const registrationGate = new Promise((resolve) => { releaseRegistration = resolve; });
+  let resolveEntered;
+  const allEntered = new Promise((resolve) => { resolveEntered = resolve; });
+  const attempts = new Map();
+  let active = 0;
+  let maximumActive = 0;
+  const fake = new FakeAnalyzeSession();
+  const baseCallDirect = fake.callDirect.bind(fake);
+  fake.callDirect = async (command, params) => {
+    if (command !== "runPersistentScript" && command !== "stopScript") {
+      return await baseCallDirect(command, params);
+    }
+    if (command === "stopScript") {
+      fake.events.push(`stop:${params.id}`);
+      return { ok: true, id: params.id };
+    }
+    assert.equal(params.asyncMode, false);
+    assert.equal(params.waitForRegistration, true);
+    const count = (attempts.get(params.code) ?? 0) + 1;
+    attempts.set(params.code, count);
+    fake.events.push(`run:${params.code}:${count}`);
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    if ([...attempts.values()].reduce((sum, value) => sum + value, 0) === 3) resolveEntered();
+    await registrationGate;
+    active -= 1;
+    if (params.code === "script-1" && count === 1) {
+      return { ok: false, error: { message: "first registration failed", details: { scriptId: 12 } } };
+    }
+    if (params.code === "script-2") {
+      return { ok: false, error: { message: "permanent registration failure", details: { scriptId: 13 } } };
+    }
+    return { ok: true, id: 10 + Number(params.code.at(-1)), name: `script-${params.code.at(-1)}`, running: true, started: true, registrationComplete: true };
+  };
+  const harness = new DesmumeHarness({
+    isolationId: "lane-scripts",
+    config: config(),
+    sessionFactory: () => fake
+  });
+  let completed = false;
+  const pending = harness.startAnalyze({ statePath: "C:\\states\\external.dst", scripts: paths })
+    .then((result) => { completed = true; return result; });
+  await allEntered;
+  assert.equal(completed, false);
+  releaseRegistration();
+  const result = await pending;
+  assert.equal(maximumActive, 3);
+  assert.deepEqual(result.scripts, {
+    successCount: 2,
+    failureCount: 1,
+    failures: [{ index: 2, file: "broken.js", error: "runPersistentScript: permanent registration failure" }]
+  });
+  assert.equal(attempts.get("script-0"), 1);
+  assert.equal(attempts.get("script-1"), 2);
+  assert.equal(attempts.get("script-2"), 2);
+  const baselineIndex = fake.events.indexOf("mcp:saveAnalysisBaseline");
+  assert.ok(fake.events.filter((event) => event.startsWith("run:")).every((event) => fake.events.indexOf(event) > baselineIndex));
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("analysis script validation rejects non-files, non-js, invalid UTF-8, and more than eight entries before creating a lane", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "desmume-script-validation-"));
+  const invalidUtf8 = path.join(directory, "invalid.js");
+  const textFile = path.join(directory, "observer.txt");
+  const directoryJs = path.join(directory, "folder.js");
+  await writeFile(invalidUtf8, Buffer.from([0xff, 0xfe, 0x00]), undefined);
+  await writeFile(textFile, "", "utf8");
+  await mkdir(directoryJs);
+  let created = 0;
+  const manager = new HarnessManager("unused.toml", {
+    configLoader: async () => ({}),
+    harnessFactory: () => { created += 1; return {}; }
+  });
+  const invalidLists = [
+    ["relative.js"],
+    [textFile],
+    [directoryJs],
+    [invalidUtf8],
+    Array(9).fill(path.join(directory, "missing.js"))
+  ];
+  for (const scripts of invalidLists) {
+    await assert.rejects(() => manager.startAnalyze("invalid", { statePath: "state.dst", scripts }));
+  }
+  assert.equal(created, 0);
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("restartAnalyze reuses the already loaded Chrome lane without loading the ROM again", async () => {
@@ -259,7 +351,7 @@ test("HarnessManager requires restart_analyze for an existing lane and never cre
   assert.deepEqual(restarts, [{ statePath: "C:\\states\\second.dst", savePath: undefined }]);
 });
 
-test("HarnessManager allows only start_analyze to replace a runFrame-faulted lane", async () => {
+test("HarnessManager keeps runFrame-faulted lanes available only to start_analyze and close cleanup", async () => {
   let created = 0;
   let closed = 0;
   const manager = new HarnessManager("unused.toml", {
@@ -282,6 +374,7 @@ test("HarnessManager allows only start_analyze to replace a runFrame-faulted lan
   const first = await manager.create("lane-a");
   assert.equal(first.hasFatalRunFrameFault(), true);
   assert.throws(() => manager.requireExisting("lane-a"), /faulted lane/u);
+  assert.equal(manager.requireExistingForClose("lane-a"), first);
   const restarted = await manager.startAnalyze("lane-a", { statePath: "C:\\states\\fresh.dst" });
   assert.deepEqual(restarted, { status: "ok", generation: 2 });
   assert.equal(created, 2);
@@ -642,8 +735,14 @@ test("rerunPScriptConsole skips UI snapshot output and returns startup console i
       }
       if (command === "listScriptPrint") {
         assert.equal(params.id, 8);
+        assert.equal(params.startLine, 1);
         assert.equal(params.max, 20);
-        return { ok: true, logs: [{ id: 8, name: "observer", text: "ready" }] };
+        return {
+          ok: true,
+          logs: [{ id: 8, name: "observer", line: 1, text: "ready" }],
+          availableFirstLine: 1,
+          availableLastLine: 1
+        };
       }
       throw new Error(`unexpected command ${command}`);
     },
@@ -656,7 +755,9 @@ test("rerunPScriptConsole skips UI snapshot output and returns startup console i
   });
   const result = await harness.rerunPScriptConsole(scriptPath, false, "observer");
   assert.equal(result.script.id, 8);
-  assert.deepEqual(result.logs, [{ id: 8, name: "observer", text: "ready" }]);
+  assert.deepEqual(result.logs, [{ id: 8, name: "observer", line: 1, text: "ready" }]);
+  assert.equal(result.unread, true);
+  assert.equal(result.unread_count, 1);
   assert.equal(Object.hasOwn(result, "snapshot"), false);
   assert.deepEqual(fake.events, [
     "mcp:runPersistentScript",
@@ -664,13 +765,22 @@ test("rerunPScriptConsole skips UI snapshot output and returns startup console i
   ]);
 });
 
-test("scriptConsole reads one persistent-script console directly by id", async () => {
+test("scriptConsole tracks partial reads by id and resolves names to the same cursor", async () => {
+  const calls = [];
   const session = {
     async start() {},
     async callDirect(command, params) {
-      assert.equal(command, "listScriptPrint");
-      assert.deepEqual(params, { id: 12, max: 7 });
-      return { logs: [{ id: 12, name: "overlay", text: "slot 0: nil" }] };
+      calls.push({ command, params });
+      if (command === "listScripts") return { scripts: [{ id: 12, name: "overlay" }] };
+      if (command === "listScriptPrint") return {
+        logs: [
+          { id: 12, name: "overlay", line: params.startLine, text: "same" },
+          { id: 12, name: "overlay", line: params.startLine + 1, text: "same" }
+        ].filter((entry) => entry.line <= 4).slice(0, params.max),
+        availableFirstLine: 1,
+        availableLastLine: 4
+      };
+      throw new Error(`unexpected command ${command}`);
     },
     async close() {}
   };
@@ -679,9 +789,35 @@ test("scriptConsole reads one persistent-script console directly by id", async (
     config: config(),
     sessionFactory: () => session
   });
-  assert.deepEqual(await harness.scriptConsole(12, 7), {
-    logs: [{ id: 12, name: "overlay", text: "slot 0: nil" }]
-  });
+  const first = await harness.scriptConsole(12, { max: 2, markRead: true });
+  assert.equal(first.last_line, 2);
+  assert.equal(first.unread_count, 2);
+  const second = await harness.scriptConsole("overlay", { max: 2, markRead: true });
+  assert.deepEqual(second.logs.map((entry) => entry.line), [3, 4]);
+  assert.equal(second.unread, false);
+  const omitted = await harness.scriptConsole(12, { max: 2 });
+  assert.deepEqual(omitted.logs, []);
+  assert.equal(omitted.omitted, "already_transcripted");
+  assert.deepEqual(calls.filter((call) => call.command === "listScriptPrint").map((call) => call.params.startLine), [1, 3, 5]);
+});
+
+test("clearScriptConsole synchronizes one named console and all console cursors", async () => {
+  const session = {
+    async start() {},
+    async callDirect(command, params) {
+      if (command === "listScripts") return { scripts: [{ id: 7, name: "named" }] };
+      if (command === "clearScriptPrint") return params.id === 7
+        ? { ok: true, cleared: [7], consoles: [{ id: 7, nextLine: 9 }] }
+        : { ok: true, cleared: [7, 8], consoles: [{ id: 7, nextLine: 9 }, { id: 8, nextLine: 4 }] };
+      if (command === "listScriptPrint") return { logs: [], availableFirstLine: 9, availableLastLine: 8 };
+      throw new Error(`unexpected command ${command}`);
+    },
+    async close() {}
+  };
+  const harness = new DesmumeHarness({ isolationId: "lane-clear", config: config(), sessionFactory: () => session });
+  assert.deepEqual(await harness.clearScriptConsole("named"), { ok: true, cleared: [7] });
+  assert.equal((await harness.scriptConsole(7)).omitted, "already_transcripted");
+  assert.deepEqual(await harness.clearScriptConsole(), { ok: true, cleared: [7, 8] });
 });
 
 test("analysisContext is rebuilt from live browser state and keeps bounded collections", async () => {
@@ -724,7 +860,9 @@ test("analysisContext is rebuilt from live browser state and keeps bounded colle
             running: true,
             started: true,
             registrationComplete: true,
-            mcpCount: 0
+            mcpCount: 0,
+            consoleFirstLine: 1,
+            consoleLastLine: index === 0 ? 3 : 0
           })),
           { id: 100, name: "stopped", running: false }
         ]
@@ -762,6 +900,8 @@ test("analysisContext is rebuilt from live browser state and keeps bounded colle
   assert.equal(result.scripts.length, 16);
   assert.equal(result.scriptsTruncated, true);
   assert.equal(result.scripts[0].id, 3);
+  assert.equal(result.scripts[0].consoleUnread, true);
+  assert.equal(result.scripts[0].consoleUnreadCount, 3);
   assert.equal(Object.hasOwn(result.scripts[0], "sourcePath"), false);
   assert.equal(Object.hasOwn(result, "statePath"), false);
   assert.equal(Object.hasOwn(result, "stateName"), false);

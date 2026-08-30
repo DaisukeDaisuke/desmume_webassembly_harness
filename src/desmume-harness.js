@@ -38,12 +38,36 @@ function selectorParams(selector) {
 }
 
 function analysisInput(input, operation) {
-  const statePath = typeof input === "string" ? input : input?.statePath;
-  const savePath = typeof input === "object" && input !== null ? input.savePath : undefined;
+    const statePath = typeof input === "string" ? input : input?.statePath;
+    const savePath = typeof input === "object" && input !== null ? input.savePath : undefined;
   if ((statePath === undefined) === (savePath === undefined)) {
     throw new Error(`${operation} requires exactly one of statePath or savePath`);
   }
-  return { statePath, savePath };
+  const scripts = typeof input === "object" && input !== null ? input.scripts : undefined;
+  if (scripts !== undefined && !Array.isArray(scripts)) throw new Error(`${operation} scripts must be an array`);
+  if ((scripts?.length ?? 0) > 8) throw new Error(`${operation} scripts must contain at most 8 files`);
+  return { statePath, savePath, scripts: scripts ?? [] };
+}
+
+export async function prepareAnalysisInput(input, operation = "startAnalyze") {
+  const parsed = analysisInput(input, operation);
+  const scriptSources = await Promise.all(parsed.scripts.map(async (filePath, index) => {
+    const label = `${operation} scripts[${index}]`;
+    if (typeof filePath !== "string" || !path.isAbsolute(filePath)) {
+      throw new Error(`${label} must be an absolute path`);
+    }
+    if (path.extname(filePath).toLowerCase() !== ".js") {
+      throw new Error(`${label} must have a .js extension`);
+    }
+    const info = await stat(filePath);
+    if (!info.isFile()) throw new Error(`${label} must point to a regular file`);
+    return {
+      path: filePath,
+      file: path.basename(filePath),
+      code: await readUtf8Text(filePath)
+    };
+  }));
+  return { ...parsed, scriptSources };
 }
 
 function compactRunState(status) {
@@ -77,6 +101,7 @@ export class DesmumeHarness {
     this.session = sessionFactory({ isolationId, config });
     this.screenshotSerial = 0;
     this.exportSerial = { state: 0, save: 0 };
+    this.consoleReadLines = new Map();
     this.fatalRunFrameFault = false;
   }
 
@@ -87,7 +112,7 @@ export class DesmumeHarness {
   assertUsable() {
     if (!this.fatalRunFrameFault) return;
     const error = new Error(
-      `Emulator instance ${this.isolationId} is unusable after native fault runFrame; call start_analyze to create a fresh analysis instance`
+      `Emulator instance ${this.isolationId} is unusable after native fault runFrame; call start_analyze to create a fresh analysis instance, or close_instance/close_all_sessions to discard it`
     );
     error.code = "NATIVE_FAULT";
     throw error;
@@ -238,23 +263,67 @@ export class DesmumeHarness {
     return requireOk(await this.#directCall("restoreAnalysisBaseline", { name }), "restoreAnalysisBaseline");
   }
 
+  async #startAnalysisScripts(scriptSources) {
+    if (scriptSources.length === 0) return null;
+    const startOne = async (source) => requireOk(await this.#directCall("runPersistentScript", {
+      code: source.code,
+      asyncMode: false,
+      waitForRegistration: true,
+      startupTimeoutMs: 10000
+    }), "runPersistentScript");
+    const firstResults = await Promise.allSettled(scriptSources.map(startOne));
+    const retryIndexes = firstResults
+      .map((result, index) => result.status === "rejected" ? index : -1)
+      .filter((index) => index >= 0);
+    await Promise.all(retryIndexes.map(async (index) => {
+      const scriptId = Number(firstResults[index].reason?.result?.error?.details?.scriptId);
+      if (!Number.isSafeInteger(scriptId) || scriptId < 1) return;
+      await this.#directCall("stopScript", { id: scriptId }).catch(() => {});
+    }));
+    const retryResults = await Promise.allSettled(retryIndexes.map((index) => startOne(scriptSources[index])));
+    const finalResults = [...firstResults];
+    retryIndexes.forEach((index, retryIndex) => {
+      finalResults[index] = retryResults[retryIndex];
+    });
+    const failures = finalResults.flatMap((result, index) => {
+      if (result.status === "fulfilled") return [];
+      const message = String(result.reason?.message ?? result.reason ?? "unknown script startup error")
+        .replace(/\s+/gu, " ")
+        .slice(0, 240);
+      return [{ index, file: scriptSources[index].file, error: message }];
+    });
+    return {
+      successCount: scriptSources.length - failures.length,
+      failureCount: failures.length,
+      failures
+    };
+  }
+
   async startAnalyze(input) {
-    const { statePath, savePath } = analysisInput(input, "startAnalyze");
+    const prepared = Array.isArray(input?.scriptSources)
+      ? input
+      : await prepareAnalysisInput(input, "startAnalyze");
+    const { statePath, savePath, scriptSources } = prepared;
     await this.start();
     await this.loadRom();
     const stateStatus = statePath !== undefined
       ? await this.loadState(statePath)
       : await this.loadSave(savePath);
     await this.saveBaseline();
+    const scripts = await this.#startAnalysisScripts(scriptSources);
     return {
       status: "ok",
       paused: stateStatus.paused,
-      running: stateStatus.running
+      running: stateStatus.running,
+      ...(scripts ? { scripts } : {})
     };
   }
 
   async restartAnalyze(input) {
-    const { statePath, savePath } = analysisInput(input, "restartAnalyze");
+    const prepared = Array.isArray(input?.scriptSources)
+      ? input
+      : await prepareAnalysisInput(input, "restartAnalyze");
+    const { statePath, savePath, scriptSources } = prepared;
     await this.start();
     const before = await this.directStatus();
     if (!before.romLoaded) await this.loadRom();
@@ -262,11 +331,13 @@ export class DesmumeHarness {
       ? await this.loadState(statePath)
       : await this.loadSave(savePath);
     await this.saveBaseline();
+    const scripts = await this.#startAnalysisScripts(scriptSources);
     return {
       status: "ok",
       reusedWindow: true,
       paused: stateStatus.paused,
-      running: stateStatus.running
+      running: stateStatus.running,
+      ...(scripts ? { scripts } : {})
     };
   }
 
@@ -447,7 +518,10 @@ export class DesmumeHarness {
     waitForRegistration = true,
     startupTimeoutMs = 10000,
     timeoutMs = this.config.commandTimeoutMs,
-    max = 20
+    startLine,
+    max = 20,
+    markRead = false,
+    clear = false
   } = {}) {
     if (typeof asyncMode !== "boolean") throw new Error("asyncMode must be boolean");
     const absolute = path.resolve(filePath);
@@ -459,21 +533,95 @@ export class DesmumeHarness {
       "runPersistentScript"
     );
     const id = script?.id;
-    const printed = requireOk(await this.#directCall("listScriptPrint", {
-      ...(Number.isSafeInteger(id) ? { id } : {}),
-      max
-    }), "listScriptPrint");
+    const printed = Number.isSafeInteger(id)
+      ? await this.#readScriptConsole(id, { startLine, max, markRead, clear })
+      : { logs: [], unread: false, unread_count: 0, first_line: null, last_line: null };
     return {
       ok: true,
       script,
-      logs: printed.logs ?? []
+      ...printed
     };
   }
 
-  async scriptConsole(scriptId, max = 20) {
-    if (!Number.isSafeInteger(scriptId) || scriptId < 1) throw new Error("script_id must be a positive integer");
+  async #resolveConsoleScriptId(selector) {
+    if (Number.isSafeInteger(selector) && selector > 0) return selector;
+    if (typeof selector !== "string" || !selector.trim()) {
+      throw new Error("script selector must be a positive script_id or a non-empty name");
+    }
+    const listed = await this.listScripts();
+    const matches = (listed.scripts ?? []).filter((script) => script.name === selector.trim());
+    if (matches.length !== 1) throw new Error(`script name must resolve to exactly one script: ${selector.trim()}`);
+    const scriptId = Number(matches[0].id);
+    if (!Number.isSafeInteger(scriptId) || scriptId < 1) throw new Error(`script name resolved to an invalid id: ${selector.trim()}`);
+    return scriptId;
+  }
+
+  async #readScriptConsole(selector, {
+    startLine,
+    max = 20,
+    markRead = false,
+    clear = false
+  } = {}) {
+    const scriptId = await this.#resolveConsoleScriptId(selector);
     if (!Number.isSafeInteger(max) || max < 1 || max > 1000) throw new Error("max must be an integer from 1 through 1000");
-    return requireOk(await this.#directCall("listScriptPrint", { id: scriptId, max }), "listScriptPrint");
+    if (startLine !== undefined && (!Number.isSafeInteger(startLine) || startLine < 1)) {
+      throw new Error("start_line must be a positive integer");
+    }
+    if (typeof markRead !== "boolean") throw new Error("mark_read must be boolean");
+    if (typeof clear !== "boolean") throw new Error("clear must be boolean");
+    let readLine = this.consoleReadLines.get(scriptId) ?? 0;
+    const printed = requireOk(await this.#directCall("listScriptPrint", {
+      id: scriptId,
+      startLine: startLine ?? readLine + 1,
+      max
+    }), "listScriptPrint");
+    const logs = Array.isArray(printed.logs) ? printed.logs : [];
+    const returnedLastLine = Number(logs.at(-1)?.line);
+    if (markRead && Number.isSafeInteger(returnedLastLine)) {
+      readLine = Math.max(readLine, returnedLastLine);
+      this.consoleReadLines.set(scriptId, readLine);
+    }
+    if (clear) {
+      const cleared = requireOk(await this.#directCall("clearScriptPrint", { id: scriptId }), "clearScriptPrint");
+      const nextLine = Number(cleared.consoles?.find((entry) => Number(entry.id) === scriptId)?.nextLine);
+      if (Number.isSafeInteger(nextLine) && nextLine > 0) {
+        readLine = nextLine - 1;
+        this.consoleReadLines.set(scriptId, readLine);
+      }
+    }
+    const availableFirstLine = Number(printed.availableFirstLine);
+    const availableLastLine = Number(printed.availableLastLine);
+    const unreadCount = clear || !Number.isSafeInteger(availableLastLine)
+      ? 0
+      : Math.max(0, availableLastLine - Math.max(readLine, availableFirstLine - 1));
+    return {
+      logs,
+      unread: unreadCount > 0,
+      unread_count: unreadCount,
+      first_line: Number.isSafeInteger(Number(logs[0]?.line)) ? Number(logs[0].line) : null,
+      last_line: Number.isSafeInteger(returnedLastLine) ? returnedLastLine : null,
+      ...(logs.length === 0 && unreadCount === 0 ? { omitted: "already_transcripted" } : {}),
+      ...(clear ? { cleared: true } : {})
+    };
+  }
+
+  async scriptConsole(selector, options = {}) {
+    return await this.#readScriptConsole(selector, options);
+  }
+
+  async clearScriptConsole(selector) {
+    const scriptId = selector === undefined ? undefined : await this.#resolveConsoleScriptId(selector);
+    const cleared = requireOk(await this.#directCall("clearScriptPrint", {
+      ...(scriptId === undefined ? {} : { id: scriptId })
+    }), "clearScriptPrint");
+    for (const console of cleared.consoles ?? []) {
+      const id = Number(console.id);
+      const nextLine = Number(console.nextLine);
+      if (Number.isSafeInteger(id) && id > 0 && Number.isSafeInteger(nextLine) && nextLine > 0) {
+        this.consoleReadLines.set(id, nextLine - 1);
+      }
+    }
+    return { ok: true, cleared: cleared.cleared ?? [] };
   }
 
   async analysisContext({ includeBreakpoints = false } = {}) {
@@ -494,7 +642,15 @@ export class DesmumeHarness {
       registrationComplete: script.registrationComplete,
       identitySource: script.identitySource,
       asyncMode: script.asyncMode,
-      mcpCount: script.mcpCount
+      mcpCount: script.mcpCount,
+      consoleUnread: Number(script.consoleLastLine ?? 0) > Math.max(
+        this.consoleReadLines.get(Number(script.id)) ?? 0,
+        Number(script.consoleFirstLine ?? 1) - 1
+      ),
+      consoleUnreadCount: Math.max(0, Number(script.consoleLastLine ?? 0) - Math.max(
+        this.consoleReadLines.get(Number(script.id)) ?? 0,
+        Number(script.consoleFirstLine ?? 1) - 1
+      ))
     }));
     const baselinesSource = Array.isArray(baselineList?.baselines) ? baselineList.baselines : [];
     const baselines = baselinesSource.slice(0, 16).map((baseline) => ({

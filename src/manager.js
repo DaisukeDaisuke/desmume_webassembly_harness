@@ -1,7 +1,7 @@
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { loadHarnessConfig } from "./config.js";
-import { DesmumeHarness } from "./desmume-harness.js";
+import { DesmumeHarness, prepareAnalysisInput } from "./desmume-harness.js";
 
 const START_ANALYZE_MAX_ATTEMPTS = 3;
 const START_ANALYZE_RETRY_DELAY_MS = 500;
@@ -48,7 +48,22 @@ export class HarnessManager {
     throw new Error(`Multiple emulator instances exist; specify isolation_id. Existing ids: ${ids}`);
   }
 
+  requireExistingForClose(isolationId) {
+    if (isolationId !== undefined) {
+      const harness = this.instances.get(isolationId);
+      if (!harness) throw new Error(`No existing emulator instance for isolation_id ${isolationId}; call start_analyze first`);
+      return harness;
+    }
+    if (this.instances.size === 1) return this.instances.values().next().value;
+    if (this.instances.size === 0) throw new Error("No existing emulator instances; call start_analyze first");
+    const ids = [...this.instances.keys()].slice(0, 16).join(", ");
+    throw new Error(`Multiple emulator instances exist; specify isolation_id. Existing ids: ${ids}`);
+  }
+
   async startAnalyze(isolationId = "default", input) {
+    const preparedInput = input?.scripts === undefined
+      ? input
+      : await prepareAnalysisInput(input, "startAnalyze");
     const existing = this.instances.get(isolationId);
     if (existing) {
       if (existing.hasFatalRunFrameFault?.()) {
@@ -65,7 +80,7 @@ export class HarnessManager {
       let lastError = null;
       for (let attempt = 1; attempt <= this.startAnalyzeMaxAttempts; attempt += 1) {
         try {
-          return await (await this.create(isolationId)).startAnalyze(input);
+          return await (await this.create(isolationId)).startAnalyze(preparedInput);
         } catch (error) {
           lastError = error;
           await this.close(isolationId).catch(() => {});
@@ -80,7 +95,10 @@ export class HarnessManager {
   }
 
   async restartAnalyze(isolationId, input) {
-    return await this.requireExisting(isolationId).restartAnalyze(input);
+    const preparedInput = input?.scripts === undefined
+      ? input
+      : await prepareAnalysisInput(input, "restartAnalyze");
+    return await this.requireExisting(isolationId).restartAnalyze(preparedInput);
   }
 
   listInstances() {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
+import path from "node:path";
 import { normalizeWebMcpExecution } from "../src/chrome-session.js";
 import {
   inheritMicroMacroIsolation,
@@ -83,6 +84,39 @@ test("start_analyze forwards caller-supplied State and Save inputs to new lanes"
     { isolationId: "lane-a", input: { statePath: "C:\\states\\a.dst", savePath: undefined } },
     { isolationId: "lane-b", input: { statePath: undefined, savePath: "C:\\saves\\a.sav" } }
   ]);
+});
+
+test("start_analyze forwards at most eight absolute JavaScript paths", async () => {
+  const schema = TOOLS.find((tool) => tool.name === "start_analyze").inputSchema.properties.scripts;
+  assert.equal(schema.type, "array");
+  assert.equal(schema.maxItems, 8);
+  assert.equal(schema.items.type, "string");
+  const scriptPath = path.resolve("observer.js");
+  let received;
+  const server = new McpHarnessServer({
+    configPath: "harness.toml",
+    managerFactory: () => ({
+      async startAnalyze(_isolationId, input) { received = input; return { status: "ok" }; },
+      async closeAll() {}
+    })
+  });
+  const reply = await server.handle({
+    jsonrpc: "2.0",
+    id: 13,
+    method: "tools/call",
+    params: { name: "start_analyze", arguments: { state_path: "state.dst", scripts: [scriptPath] } }
+  });
+  assert.equal(reply.result.isError, false);
+  assert.deepEqual(received.scripts, [scriptPath]);
+  for (const scripts of [["relative.js"], [path.resolve("observer.txt")], Array(9).fill(scriptPath)]) {
+    const rejected = await server.handle({
+      jsonrpc: "2.0",
+      id: 14,
+      method: "tools/call",
+      params: { name: "start_analyze", arguments: { state_path: "state.dst", scripts } }
+    });
+    assert.equal(rejected.result.isError, true);
+  }
 });
 
 test("existing-lane tools route through requireExisting and do not create a new lane", async () => {
@@ -223,6 +257,82 @@ test("inject_bytes_file and close_all_sessions expose the dedicated top-level op
   assert.equal(closed.result.structuredContent.closed, 3);
 });
 
+test("close_instance bypasses a faulted-lane usability guard", async () => {
+  const calls = [];
+  const harness = { isolationId: "faulted-lane" };
+  const manager = {
+    requireExisting() {
+      throw new Error("faulted lane must not be used normally");
+    },
+    requireExistingForClose(id) {
+      calls.push({ requireExistingForClose: id });
+      return harness;
+    },
+    async close(id) {
+      calls.push({ close: id });
+      return true;
+    },
+    async closeAll() { return 0; }
+  };
+  const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
+  const reply = await server.handle({
+    jsonrpc: "2.0",
+    id: 15,
+    method: "tools/call",
+    params: { name: "close_instance", arguments: { isolation_id: "faulted-lane" } }
+  });
+  assert.equal(reply.result.structuredContent.closed, true);
+  assert.deepEqual(calls, [
+    { requireExistingForClose: "faulted-lane" },
+    { close: "faulted-lane" }
+  ]);
+});
+
+test("micro macro close_instance also bypasses a faulted-lane usability guard", async () => {
+  const calls = [];
+  const harness = {
+    isolationId: "faulted-lane",
+    async setUiInteractionLock() {
+      throw new Error("close-only macro must not UI-lock a faulted lane");
+    }
+  };
+  const manager = {
+    requireExisting() {
+      throw new Error("faulted lane must not be used normally");
+    },
+    requireExistingForClose(id) {
+      calls.push({ requireExistingForClose: id });
+      return harness;
+    },
+    async close(id) {
+      calls.push({ close: id });
+      return true;
+    },
+    async closeAll() { return 0; }
+  };
+  const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
+  const reply = await server.handle({
+    jsonrpc: "2.0",
+    id: 16,
+    method: "tools/call",
+    params: {
+      name: "micro_macro_exec",
+      arguments: {
+        id: "close-faulted-lane",
+        isolation_id: "faulted-lane",
+        steps: [{ tool: "close_instance", arguments: {} }]
+      }
+    }
+  });
+  assert.equal(reply.result.structuredContent.ok, true);
+  assert.equal(reply.result.structuredContent.results[0].result.closed, true);
+  assert.deepEqual(calls, [
+    { requireExistingForClose: "faulted-lane" },
+    { requireExistingForClose: "faulted-lane" },
+    { close: "faulted-lane" }
+  ]);
+});
+
 test("direct_status and analysis_context route to compact direct harness helpers", async () => {
   const calls = [];
   const harness = {
@@ -269,6 +379,9 @@ test("rerun_pscript_console returns startup logs through one stdio MCP tool", as
       assert.equal(asyncMode, false);
       assert.equal(name, "overlay");
       assert.equal(options.max, 7);
+      assert.equal(options.startLine, 3);
+      assert.equal(options.markRead, true);
+      assert.equal(options.clear, false);
       return { ok: true, script: { id: 9, name: "overlay", running: true }, logs: [{ id: 9, name: "overlay", text: "ready" }] };
     }
   };
@@ -283,19 +396,19 @@ test("rerun_pscript_console returns startup logs through one stdio MCP tool", as
     method: "tools/call",
     params: {
       name: "rerun_pscript_console",
-      arguments: { path: "C:\\scripts\\overlay.js", name: "overlay", max: 7 }
+      arguments: { path: "C:\\scripts\\overlay.js", name: "overlay", start_line: 3, max: 7, mark_read: true }
     }
   });
   assert.equal(reply.result.structuredContent.script.id, 9);
   assert.equal(reply.result.structuredContent.logs[0].text, "ready");
 });
 
-test("script_console routes a bounded direct console read by script id", async () => {
+test("script_console routes console reads by script id or name", async () => {
   const harness = {
     config: { commandTimeoutMs: 600000, baselineName: "base", replaceBaseline: true },
-    async scriptConsole(scriptId, max) {
-      assert.equal(scriptId, 4);
-      assert.equal(max, 9);
+    async scriptConsole(selector, options) {
+      assert.equal(selector, "overlay");
+      assert.deepEqual(options, { startLine: undefined, max: 9, markRead: false, clear: true });
       return { logs: [{ id: 4, name: "overlay", text: "ready" }] };
     }
   };
@@ -310,10 +423,27 @@ test("script_console routes a bounded direct console read by script id", async (
     method: "tools/call",
     params: {
       name: "script_console",
-      arguments: { script_id: 4, max: 9 }
+      arguments: { name: "overlay", max: 9, clear: true }
     }
   });
   assert.equal(reply.result.structuredContent.logs[0].text, "ready");
+});
+
+test("clear_script_console accepts a name and omitting selectors clears all consoles", async () => {
+  const selectors = [];
+  const harness = { async clearScriptConsole(selector) { selectors.push(selector); return { ok: true, cleared: [4] }; } };
+  const server = new McpHarnessServer({
+    configPath: "harness.toml",
+    managerFactory: () => ({ requireExisting: () => harness, async closeAll() {} })
+  });
+  for (const argumentsValue of [{ name: "overlay" }, {}]) {
+    const reply = await server.handle({
+      jsonrpc: "2.0", id: 25, method: "tools/call",
+      params: { name: "clear_script_console", arguments: argumentsValue }
+    });
+    assert.equal(reply.result.isError, false);
+  }
+  assert.deepEqual(selectors, ["overlay", undefined]);
 });
 
 test("micro macro tool resolution exhaustively accepts namespaced top-level tools by suffix", () => {
