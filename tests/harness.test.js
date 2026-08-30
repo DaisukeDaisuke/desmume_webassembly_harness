@@ -259,7 +259,7 @@ test("HarnessManager requires restart_analyze for an existing lane and never cre
   assert.deepEqual(restarts, [{ statePath: "C:\\states\\second.dst", savePath: undefined }]);
 });
 
-test("HarnessManager allows only start_analyze to replace a runFrame-faulted lane", async () => {
+test("HarnessManager keeps runFrame-faulted lanes available only to start_analyze and close cleanup", async () => {
   let created = 0;
   let closed = 0;
   const manager = new HarnessManager("unused.toml", {
@@ -282,6 +282,7 @@ test("HarnessManager allows only start_analyze to replace a runFrame-faulted lan
   const first = await manager.create("lane-a");
   assert.equal(first.hasFatalRunFrameFault(), true);
   assert.throws(() => manager.requireExisting("lane-a"), /faulted lane/u);
+  assert.equal(manager.requireExistingForClose("lane-a"), first);
   const restarted = await manager.startAnalyze("lane-a", { statePath: "C:\\states\\fresh.dst" });
   assert.deepEqual(restarted, { status: "ok", generation: 2 });
   assert.equal(created, 2);

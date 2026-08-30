@@ -74,7 +74,7 @@ const microMacroStepSchema = objectSchema({
 const TOOLS = Object.freeze([
   {
     name: "start_analyze",
-    description: "Create a new Chrome/DeSmuME lane, load ROM plus one State/Save, save the analysis baseline, and return compact run state. If the lane already exists, use restart_analyze.",
+    description: "Create a new Chrome/DeSmuME lane, load ROM plus one State/Save, save the analysis baseline, and return compact run state. If a healthy lane already exists, use restart_analyze. A runFrame-native-faulted lane with the same id is discarded and recreated fresh.",
     inputSchema: objectSchema({
       isolation_id: startIsolationProperty,
       state_path: { type: "string", minLength: 1, description: "Local State file to load for this analysis start." },
@@ -645,7 +645,9 @@ export class McpHarnessServer {
         };
         const ensureUiLocked = async (step, stepArguments) => {
           const definition = TOOLS.find((tool) => tool.name === step.tool);
-          if (!definition?.inputSchema?.properties?.isolation_id || step.tool === "start_analyze") return;
+          if (!definition?.inputSchema?.properties?.isolation_id
+              || step.tool === "start_analyze"
+              || step.tool === "close_instance") return;
           const isolationId = stepArguments.isolation_id;
           const harness = this.manager.requireExisting(isolationId);
           await lockHarness(harness);
@@ -657,6 +659,7 @@ export class McpHarnessServer {
             const targetIds = new Set();
             let needsImplicitTarget = false;
             for (const step of macro.steps) {
+              if (step.tool === "close_instance" || step.tool === "close_all_sessions") continue;
               const definition = TOOLS.find((tool) => tool.name === step.tool);
               if (!definition?.inputSchema?.properties?.isolation_id) continue;
               const targetId = step.arguments.isolation_id ?? inheritedIsolation;
@@ -676,7 +679,7 @@ export class McpHarnessServer {
             await ensureUiLocked(step, stepArguments);
             if (step.wait_ms > 0) await sleep(step.wait_ms);
             if (step.tool === "close_instance") {
-              await releaseHarness(this.manager.requireExisting(stepArguments.isolation_id));
+              await releaseHarness(this.manager.requireExistingForClose(stepArguments.isolation_id));
             } else if (step.tool === "close_all_sessions") {
               for (const harness of [...lockedHarnesses]) await releaseHarness(harness);
             }
@@ -787,7 +790,7 @@ export class McpHarnessServer {
         return await (await this.#harness(args)).injectBytesFile(args.file_path, args.address, args.cpu);
       }
       case "close_instance": {
-        const harness = this.manager.requireExisting(optionalExistingIsolation(args));
+        const harness = this.manager.requireExistingForClose(optionalExistingIsolation(args));
         return { closed: await this.manager.close(harness.isolationId) };
       }
       case "close_all_sessions":

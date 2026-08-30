@@ -223,6 +223,82 @@ test("inject_bytes_file and close_all_sessions expose the dedicated top-level op
   assert.equal(closed.result.structuredContent.closed, 3);
 });
 
+test("close_instance bypasses a faulted-lane usability guard", async () => {
+  const calls = [];
+  const harness = { isolationId: "faulted-lane" };
+  const manager = {
+    requireExisting() {
+      throw new Error("faulted lane must not be used normally");
+    },
+    requireExistingForClose(id) {
+      calls.push({ requireExistingForClose: id });
+      return harness;
+    },
+    async close(id) {
+      calls.push({ close: id });
+      return true;
+    },
+    async closeAll() { return 0; }
+  };
+  const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
+  const reply = await server.handle({
+    jsonrpc: "2.0",
+    id: 15,
+    method: "tools/call",
+    params: { name: "close_instance", arguments: { isolation_id: "faulted-lane" } }
+  });
+  assert.equal(reply.result.structuredContent.closed, true);
+  assert.deepEqual(calls, [
+    { requireExistingForClose: "faulted-lane" },
+    { close: "faulted-lane" }
+  ]);
+});
+
+test("micro macro close_instance also bypasses a faulted-lane usability guard", async () => {
+  const calls = [];
+  const harness = {
+    isolationId: "faulted-lane",
+    async setUiInteractionLock() {
+      throw new Error("close-only macro must not UI-lock a faulted lane");
+    }
+  };
+  const manager = {
+    requireExisting() {
+      throw new Error("faulted lane must not be used normally");
+    },
+    requireExistingForClose(id) {
+      calls.push({ requireExistingForClose: id });
+      return harness;
+    },
+    async close(id) {
+      calls.push({ close: id });
+      return true;
+    },
+    async closeAll() { return 0; }
+  };
+  const server = new McpHarnessServer({ configPath: "harness.toml", managerFactory: () => manager });
+  const reply = await server.handle({
+    jsonrpc: "2.0",
+    id: 16,
+    method: "tools/call",
+    params: {
+      name: "micro_macro_exec",
+      arguments: {
+        id: "close-faulted-lane",
+        isolation_id: "faulted-lane",
+        steps: [{ tool: "close_instance", arguments: {} }]
+      }
+    }
+  });
+  assert.equal(reply.result.structuredContent.ok, true);
+  assert.equal(reply.result.structuredContent.results[0].result.closed, true);
+  assert.deepEqual(calls, [
+    { requireExistingForClose: "faulted-lane" },
+    { requireExistingForClose: "faulted-lane" },
+    { close: "faulted-lane" }
+  ]);
+});
+
 test("direct_status and analysis_context route to compact direct harness helpers", async () => {
   const calls = [];
   const harness = {

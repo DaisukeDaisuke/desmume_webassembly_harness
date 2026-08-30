@@ -48,6 +48,18 @@ export class HarnessManager {
     throw new Error(`Multiple emulator instances exist; specify isolation_id. Existing ids: ${ids}`);
   }
 
+  requireExistingForClose(isolationId) {
+    if (isolationId !== undefined) {
+      const harness = this.instances.get(isolationId);
+      if (!harness) throw new Error(`No existing emulator instance for isolation_id ${isolationId}; call start_analyze first`);
+      return harness;
+    }
+    if (this.instances.size === 1) return this.instances.values().next().value;
+    if (this.instances.size === 0) throw new Error("No existing emulator instances; call start_analyze first");
+    const ids = [...this.instances.keys()].slice(0, 16).join(", ");
+    throw new Error(`Multiple emulator instances exist; specify isolation_id. Existing ids: ${ids}`);
+  }
+
   async startAnalyze(isolationId = "default", input) {
     const existing = this.instances.get(isolationId);
     if (existing) {

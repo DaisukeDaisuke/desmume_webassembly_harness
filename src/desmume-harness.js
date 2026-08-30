@@ -87,7 +87,7 @@ export class DesmumeHarness {
   assertUsable() {
     if (!this.fatalRunFrameFault) return;
     const error = new Error(
-      `Emulator instance ${this.isolationId} is unusable after native fault runFrame; call start_analyze to create a fresh analysis instance`
+      `Emulator instance ${this.isolationId} is unusable after native fault runFrame; call start_analyze to create a fresh analysis instance, or close_instance/close_all_sessions to discard it`
     );
     error.code = "NATIVE_FAULT";
     throw error;
