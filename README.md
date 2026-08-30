@@ -75,6 +75,7 @@ tool_output_token_limit = 1000000
 `start_analyze`だけが新しいChrome laneを作成します。`status`、`call`、`analysis_context`、script操作、screenshotなど他のtoolへ存在しない`isolation_id`を渡してもChromeは作られずエラーになります。
 同じ`isolation_id`の`start_analyze`がすでに進行中の場合も、二重起動せず直ちにエラーにします。
 `start_analyze`以外は`isolation_id`を省略したとき既存laneが1個ならそれを使い、複数laneがある場合は明示指定を要求します。
+既存laneで`NATIVE_FAULT`の`runFrame`が観測された場合、そのlaneはharness側で使用不能として固定され、それ以降のlane操作は直ちにエラーになります。復旧入口は`start_analyze`だけで、同じ`isolation_id`へ`start_analyze`した場合もfault済みChromeを閉じてfresh laneを作成します。macro実行中にfaultした場合も次stepへ進まず、UI interaction lockの解除だけは内部cleanupとして実行します。
 ## マイクロマクロ
 `micro_macro_exec`はDeSmuMEページ内command専用のbatchではなく、`call`、`resume`、`rerun_pscript`、`call_pscript_mcp`、`load_state_file`などharnessが公開しているトップレベルMCP toolそのものを短い待機付き手順へまとめます。マクロはstdio MCPプロセス内メモリに保持され、AIが任意のIDを決めます。
 ```json

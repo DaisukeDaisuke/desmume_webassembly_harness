@@ -17,6 +17,20 @@ function requireOk(result, operation) {
   return result;
 }
 
+function isRunFrameNativeFault(value) {
+  const candidates = [value, value?.result];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const error = candidate.error && typeof candidate.error === "object" ? candidate.error : null;
+    const code = error?.code ?? candidate.mcpCode;
+    const details = error?.details ?? candidate.mcpDetails;
+    const message = String(error?.message ?? candidate.message ?? "");
+    if (code === "NATIVE_FAULT" && details?.operation === "runFrame") return true;
+    if (/native fault(?: during)? runFrame/iu.test(message)) return true;
+  }
+  return false;
+}
+
 function selectorParams(selector) {
   if (Number.isSafeInteger(selector) && selector > 0) return { id: selector };
   if (typeof selector === "string" && selector.trim()) return { name: selector.trim() };
@@ -63,6 +77,24 @@ export class DesmumeHarness {
     this.session = sessionFactory({ isolationId, config });
     this.screenshotSerial = 0;
     this.exportSerial = { state: 0, save: 0 };
+    this.fatalRunFrameFault = false;
+  }
+
+  hasFatalRunFrameFault() {
+    return this.fatalRunFrameFault;
+  }
+
+  assertUsable() {
+    if (!this.fatalRunFrameFault) return;
+    const error = new Error(
+      `Emulator instance ${this.isolationId} is unusable after native fault runFrame; call start_analyze to create a fresh analysis instance`
+    );
+    error.code = "NATIVE_FAULT";
+    throw error;
+  }
+
+  #observeRunFrameNativeFault(value) {
+    if (isRunFrameNativeFault(value)) this.fatalRunFrameFault = true;
   }
 
   describe() {
@@ -75,8 +107,18 @@ export class DesmumeHarness {
   }
 
   async call(command, params = {}, timeoutMs = this.config.commandTimeoutMs) {
+    this.assertUsable();
     await this.start();
-    return await this.session.callWebMcp("desmume.call", { command, params }, timeoutMs);
+    try {
+      const result = await this.session.callWebMcp("desmume.call", { command, params }, timeoutMs);
+      this.#observeRunFrameNativeFault(result);
+      this.assertUsable();
+      return result;
+    } catch (error) {
+      this.#observeRunFrameNativeFault(error);
+      this.assertUsable();
+      throw error;
+    }
   }
 
   async status() {
@@ -89,7 +131,7 @@ export class DesmumeHarness {
 
   async setUiInteractionLock(owner, locked) {
     return requireOk(
-      await this.#directCall("setUiInteractionLock", { owner, locked }),
+      await this.#directCallUnchecked("setUiInteractionLock", { owner, locked }),
       "setUiInteractionLock"
     );
   }
@@ -103,6 +145,20 @@ export class DesmumeHarness {
   }
 
   async #directCall(command, params = {}, timeoutMs = this.config.commandTimeoutMs) {
+    this.assertUsable();
+    try {
+      const result = await this.#directCallUnchecked(command, params, timeoutMs);
+      this.#observeRunFrameNativeFault(result);
+      this.assertUsable();
+      return result;
+    } catch (error) {
+      this.#observeRunFrameNativeFault(error);
+      this.assertUsable();
+      throw error;
+    }
+  }
+
+  async #directCallUnchecked(command, params = {}, timeoutMs = this.config.commandTimeoutMs) {
     await this.start();
     return await this.session.callDirect(command, params, timeoutMs);
   }

@@ -102,6 +102,78 @@ test("restartAnalyze reuses the already loaded Chrome lane without loading the R
   assert.ok(fake.events.indexOf("mcp:saveAnalysisBaseline") > fake.events.indexOf(`upload:State In:${statePath}`));
 });
 
+test("native fault runFrame permanently disables a harness lane after the fault is observed", async () => {
+  let directCalls = 0;
+  const session = {
+    async start() {},
+    async callDirect(command) {
+      directCalls += 1;
+      if (command === "callPScriptMcp") {
+        return {
+          ok: false,
+          error: {
+            code: "NATIVE_FAULT",
+            message: "native fault during runFrame (-123)",
+            details: { operation: "runFrame", nativeCode: -123 }
+          }
+        };
+      }
+      return { ok: true, paused: true, running: false };
+    },
+    async close() {}
+  };
+  const harness = new DesmumeHarness({
+    isolationId: "faulted-lane",
+    config: config(),
+    sessionFactory: () => session
+  });
+  await assert.rejects(
+    () => harness.callPScriptMcp("boom", {}, { blocking: true }),
+    /unusable after native fault runFrame/u
+  );
+  assert.equal(harness.hasFatalRunFrameFault(), true);
+  assert.equal(directCalls, 1);
+  await assert.rejects(() => harness.directStatus(), /unusable after native fault runFrame/u);
+  assert.equal(directCalls, 1, "faulted lane must reject before another page command is sent");
+});
+
+test("UI interaction lock cleanup remains available after native fault runFrame", async () => {
+  const directCalls = [];
+  const session = {
+    async start() {},
+    async callDirect(command, params) {
+      directCalls.push({ command, params });
+      if (command === "callPScriptMcp") {
+        return {
+          ok: false,
+          error: {
+            code: "NATIVE_FAULT",
+            message: "native fault during runFrame",
+            details: { operation: "runFrame" }
+          }
+        };
+      }
+      if (command === "setUiInteractionLock") return { ok: true, locked: !!params.locked };
+      throw new Error(`unexpected command ${command}`);
+    },
+    async close() {}
+  };
+  const harness = new DesmumeHarness({
+    isolationId: "faulted-lock-lane",
+    config: config(),
+    sessionFactory: () => session
+  });
+  await assert.rejects(
+    () => harness.callPScriptMcp("boom", {}, { blocking: true }),
+    /unusable after native fault runFrame/u
+  );
+  await harness.setUiInteractionLock("macro:cleanup", false);
+  assert.deepEqual(directCalls.at(-1), {
+    command: "setUiInteractionLock",
+    params: { owner: "macro:cleanup", locked: false }
+  });
+});
+
 test("ROM startup does not complete until the emulator is actually running", async () => {
   let statusReads = 0;
   const session = {
@@ -185,6 +257,36 @@ test("HarnessManager requires restart_analyze for an existing lane and never cre
   assert.equal(restarted.reusedWindow, true);
   assert.equal(created, 1);
   assert.deepEqual(restarts, [{ statePath: "C:\\states\\second.dst", savePath: undefined }]);
+});
+
+test("HarnessManager allows only start_analyze to replace a runFrame-faulted lane", async () => {
+  let created = 0;
+  let closed = 0;
+  const manager = new HarnessManager("unused.toml", {
+    configLoader: async () => ({}),
+    harnessFactory: ({ isolationId }) => {
+      created += 1;
+      const faulted = created === 1;
+      return {
+        isolationId,
+        hasFatalRunFrameFault: () => faulted,
+        assertUsable() {
+          if (faulted) throw new Error("faulted lane");
+        },
+        async startAnalyze() { return { status: "ok", generation: created }; },
+        async close() { closed += 1; }
+      };
+    },
+    startAnalyzeMaxAttempts: 1
+  });
+  const first = await manager.create("lane-a");
+  assert.equal(first.hasFatalRunFrameFault(), true);
+  assert.throws(() => manager.requireExisting("lane-a"), /faulted lane/u);
+  const restarted = await manager.startAnalyze("lane-a", { statePath: "C:\\states\\fresh.dst" });
+  assert.deepEqual(restarted, { status: "ok", generation: 2 });
+  assert.equal(created, 2);
+  assert.equal(closed, 1);
+  assert.equal(manager.requireExisting("lane-a").hasFatalRunFrameFault(), false);
 });
 
 test("concurrent start_analyze calls for one isolation id cannot create two Chrome lanes", async () => {

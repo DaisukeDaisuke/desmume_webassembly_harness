@@ -35,17 +35,27 @@ export class HarnessManager {
     if (isolationId !== undefined) {
       const harness = this.instances.get(isolationId);
       if (!harness) throw new Error(`No existing emulator instance for isolation_id ${isolationId}; call start_analyze first`);
+      harness.assertUsable?.();
       return harness;
     }
-    if (this.instances.size === 1) return this.instances.values().next().value;
+    if (this.instances.size === 1) {
+      const harness = this.instances.values().next().value;
+      harness.assertUsable?.();
+      return harness;
+    }
     if (this.instances.size === 0) throw new Error("No existing emulator instances; call start_analyze first");
     const ids = [...this.instances.keys()].slice(0, 16).join(", ");
     throw new Error(`Multiple emulator instances exist; specify isolation_id. Existing ids: ${ids}`);
   }
 
   async startAnalyze(isolationId = "default", input) {
-    if (this.instances.has(isolationId)) {
-      throw new Error(`Emulator instance ${isolationId} already exists; use restart_analyze to reuse its Chrome window`);
+    const existing = this.instances.get(isolationId);
+    if (existing) {
+      if (existing.hasFatalRunFrameFault?.()) {
+        await this.close(isolationId);
+      } else {
+        throw new Error(`Emulator instance ${isolationId} already exists; use restart_analyze to reuse its Chrome window`);
+      }
     }
     if (this.starting.has(isolationId)) {
       throw new Error(`Emulator instance ${isolationId} is already starting; do not start a second Chrome window`);
