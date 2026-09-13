@@ -273,12 +273,13 @@ const TOOLS = Object.freeze([
   },
   {
     name: "script_console",
-    description: "Return line-numbered print/printf console output for one persistent script selected by script_id or name.",
+    description: "Return print/printf console output for one persistent script selected by script_id or name. By default output is one newline-joined string; set structured=true for per-line log objects.",
     inputSchema: {
       ...objectSchema({
         isolation_id: isolationProperty,
         script_id: { type: "integer", minimum: 1 },
         name: { type: "string", minLength: 1, maxLength: 64 },
+        structured: { type: "boolean", default: false, description: "Return the existing per-line logs array instead of newline-joined output." },
         ...consoleReadProperties
       }),
       oneOf: [{ required: ["script_id"] }, { required: ["name"] }]
@@ -816,7 +817,17 @@ export class McpHarnessServer {
         );
       }
       case "script_console": {
-        return await (await this.#harness(args)).scriptConsole(scriptSelector(args), consoleReadOptions(args));
+        const result = await (await this.#harness(args)).scriptConsole(scriptSelector(args), consoleReadOptions(args));
+        if (args.structured === true) return result;
+        const logs = Array.isArray(result?.logs) ? result.logs : [];
+        const output = logs.map((entry) => typeof entry?.text === "string" ? entry.text : "").join("\n");
+        const structuredContent = { ...result, output };
+        delete structuredContent.logs;
+        return {
+          content: [{ type: "text", text: output }],
+          structuredContent,
+          isError: false
+        };
       }
       case "clear_script_console": {
         const hasId = args.script_id !== undefined;

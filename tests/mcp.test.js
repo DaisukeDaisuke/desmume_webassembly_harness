@@ -409,7 +409,12 @@ test("script_console routes console reads by script id or name", async () => {
     async scriptConsole(selector, options) {
       assert.equal(selector, "overlay");
       assert.deepEqual(options, { startLine: undefined, max: 9, markRead: false, clear: true });
-      return { logs: [{ id: 4, name: "overlay", text: "ready" }] };
+      return {
+        logs: [
+          { id: 4, name: "overlay", line: 1, text: "ready" },
+          { id: 4, name: "overlay", line: 2, text: "seed=123" }
+        ]
+      };
     }
   };
   const manager = {
@@ -426,7 +431,21 @@ test("script_console routes console reads by script id or name", async () => {
       arguments: { name: "overlay", max: 9, clear: true }
     }
   });
-  assert.equal(reply.result.structuredContent.logs[0].text, "ready");
+  assert.equal(reply.result.content[0].text, "ready\nseed=123");
+  assert.equal(reply.result.structuredContent.output, "ready\nseed=123");
+  assert.equal(Object.hasOwn(reply.result.structuredContent, "logs"), false);
+
+  const structuredReply = await server.handle({
+    jsonrpc: "2.0",
+    id: 241,
+    method: "tools/call",
+    params: {
+      name: "script_console",
+      arguments: { name: "overlay", max: 9, clear: true, structured: true }
+    }
+  });
+  assert.equal(structuredReply.result.structuredContent.logs[0].text, "ready");
+  assert.equal(structuredReply.result.structuredContent.logs[1].text, "seed=123");
 });
 
 test("clear_script_console accepts a name and omitting selectors clears all consoles", async () => {
