@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, rename, rm, stat } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, rm, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -287,52 +287,58 @@ export class ChromeSession {
       this.downloadActive = false;
       throw new Error(`Export destination already exists: ${absoluteDestination}`);
     }
-    const temporaryDirectory = await mkdtemp(path.join(destinationDirectory, ".desmume-export-"));
     const expectedFilename = command === "exportStateFile"
       ? "desmume-state.dst"
       : command === "exportSaveFile" ? "desmume-save.sav" : null;
+    if (!expectedFilename) {
+      this.downloadActive = false;
+      throw new Error(`Unsupported managed download command: ${command}`);
+    }
+    const downloadedPath = path.join(destinationDirectory, expectedFilename);
+    if (await fileExists(downloadedPath)) {
+      this.downloadActive = false;
+      throw new Error(`Chrome download destination already exists: ${downloadedPath}`);
+    }
     let downloadGuid = null;
-    let suggestedFilename = null;
     let timeout = null;
     let removeBeginListener = () => {};
     let removeProgressListener = () => {};
     try {
       const completed = new Promise((resolve, reject) => {
         timeout = setTimeout(() => reject(new Error(`${command} download did not complete within ${timeoutMs} ms`)), timeoutMs);
-        removeBeginListener = this.cdp.onEvent("Browser.downloadWillBegin", (event) => {
-          if (expectedFilename && String(event.suggestedFilename ?? "") !== expectedFilename) return;
+        removeBeginListener = this.cdp.onEvent("Page.downloadWillBegin", (event) => {
+          if (String(event.suggestedFilename ?? "") !== expectedFilename) return;
           if (downloadGuid !== null) return;
           downloadGuid = String(event.guid ?? "");
-          suggestedFilename = String(event.suggestedFilename ?? "");
-          if (!downloadGuid || !suggestedFilename) reject(new Error(`${command} download metadata was incomplete`));
+          if (!downloadGuid) reject(new Error(`${command} download metadata was incomplete`));
         });
-        removeProgressListener = this.cdp.onEvent("Browser.downloadProgress", (event) => {
+        removeProgressListener = this.cdp.onEvent("Page.downloadProgress", (event) => {
           if (!downloadGuid || String(event.guid ?? "") !== downloadGuid) return;
           if (event.state === "completed") resolve();
           else if (event.state === "canceled") reject(new Error(`${command} download was canceled`));
         });
       });
-      await this.cdp.send("Browser.setDownloadBehavior", {
+      await this.cdp.send("Page.setDownloadBehavior", {
         behavior: "allow",
-        downloadPath: temporaryDirectory,
-        eventsEnabled: true
+        downloadPath: destinationDirectory
       }, timeoutMs);
       const result = await this.callDirect(command, params, timeoutMs);
       if (result?.ok === false) {
         throw new Error(`${command}: ${result.error?.message ?? "application error"}`);
       }
       await completed;
-      const downloadedPath = path.join(temporaryDirectory, suggestedFilename);
       const info = await stat(downloadedPath);
       if (!info.isFile()) throw new Error(`${command} download did not produce a regular file`);
-      await rename(downloadedPath, absoluteDestination);
+      if (downloadedPath !== absoluteDestination) {
+        await copyFile(downloadedPath, absoluteDestination, fsConstants.COPYFILE_EXCL);
+        await rm(downloadedPath);
+      }
       return { result, path: absoluteDestination, bytes: info.size };
     } finally {
       if (timeout) clearTimeout(timeout);
       removeBeginListener();
       removeProgressListener();
-      await this.cdp?.send("Browser.setDownloadBehavior", { behavior: "default", eventsEnabled: false }, 2000).catch(() => {});
-      await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
+      await this.cdp?.send("Page.setDownloadBehavior", { behavior: "default" }, 2000).catch(() => {});
       this.downloadActive = false;
     }
   }
