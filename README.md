@@ -60,7 +60,7 @@ tool_output_token_limit = 1000000
 - `rerun_script`: UTF-8 JavaScriptファイルを読み、`desmume.runScript` 相当で実行する。
 - `rerun_pscript`: Persistent Scriptのsourceをeditorへ読み込み、直接`runLoadedPersistentScript`を実行する。同名更新の停止・script-only trap解放はページ本体のupdate経路へ任せる。
 - `rerun_pscript_console`: Persistent Scriptを読み込み・起動し、そのscriptの最新 `print(...)` 出力まで1回のMCP callで返す。
-- `script_console`: Persistent Scriptを `script_id` または `name` で指定し、未読 `print(...)` / `printf(...)` 出力を取得する。通常は改行結合済みの `output` を返し、`structured:true` のときだけ従来の行番号付き `logs` 配列を返す。部分取得、明示的既読化、取得後クリアに対応する。
+- `script_console`: Persistent Scriptを `script_id` または `name` で指定し、未読 `print(...)` / `printf(...)` 出力を改行結合済みテキストとして取得する。`structured` オプションは公開せず、常にプレーンテキスト経路を使う。同じscriptで同一出力のSHA-256が3回連続した場合は、ポーリングの無限ループとみなして3回目をエラーにする。部分取得、明示的既読化、取得後クリアに対応する。
 - `clear_script_console`: `script_id` または `name` で指定したconsoleを消去する。両方省略すると全consoleを消去する。
 - `stop_pscript`: Persistent Scriptを停止する。
 - `restart_pscript`: Persistent Scriptを再起動する。

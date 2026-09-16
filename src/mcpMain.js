@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 import process from "node:process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -273,13 +274,12 @@ const TOOLS = Object.freeze([
   },
   {
     name: "script_console",
-    description: "Return print/printf console output for one persistent script selected by script_id or name. By default output is one newline-joined string; set structured=true for per-line log objects.",
+    description: "Return print/printf console output for one persistent script selected by script_id or name as one newline-joined string. Repeating the same output hash three times is treated as a polling loop and returns an error.",
     inputSchema: {
       ...objectSchema({
         isolation_id: isolationProperty,
         script_id: { type: "integer", minimum: 1 },
         name: { type: "string", minLength: 1, maxLength: 64 },
-        structured: { type: "boolean", default: false, description: "Return the existing per-line logs array instead of newline-joined output." },
         ...consoleReadProperties
       }),
       oneOf: [{ required: ["script_id"] }, { required: ["name"] }]
@@ -600,6 +600,7 @@ export class McpHarnessServer {
     this.initialized = false;
     this.microMacros = new Map();
     this.microMacroExecutionSerial = 0;
+    this.consoleOutputHashes = new WeakMap();
   }
 
   #harness(args) {
@@ -608,6 +609,22 @@ export class McpHarnessServer {
 
   #existingHarness(args) {
     return this.manager.requireExisting(optionalExistingIsolation(args));
+  }
+
+  #guardRepeatedConsoleOutput(harness, selector, output) {
+    let states = this.consoleOutputHashes.get(harness);
+    if (!states) {
+      states = new Map();
+      this.consoleOutputHashes.set(harness, states);
+    }
+    const selectorKey = `${typeof selector}:${String(selector)}`;
+    const hash = createHash("sha256").update(output, "utf8").digest("hex");
+    const previous = states.get(selectorKey);
+    const count = previous?.hash === hash ? previous.count + 1 : 1;
+    states.set(selectorKey, { hash, count });
+    if (count >= 3) {
+      throw new Error(`script_console produced the same output hash ${count} consecutive times for ${selectorKey}; refusing unchanged output to stop a polling loop (sha256=${hash})`);
+    }
   }
 
   async #callTool(name, rawArguments) {
@@ -817,10 +834,12 @@ export class McpHarnessServer {
         );
       }
       case "script_console": {
-        const result = await (await this.#harness(args)).scriptConsole(scriptSelector(args), consoleReadOptions(args));
-        if (args.structured === true) return result;
+        const harness = await this.#harness(args);
+        const selector = scriptSelector(args);
+        const result = await harness.scriptConsole(selector, consoleReadOptions(args));
         const logs = Array.isArray(result?.logs) ? result.logs : [];
         const output = logs.map((entry) => typeof entry?.text === "string" ? entry.text : "").join("\n");
+        this.#guardRepeatedConsoleOutput(harness, selector, output);
         const structuredContent = { ...result, output };
         delete structuredContent.logs;
         return {

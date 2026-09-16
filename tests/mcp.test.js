@@ -403,16 +403,19 @@ test("rerun_pscript_console returns startup logs through one stdio MCP tool", as
   assert.equal(reply.result.structuredContent.logs[0].text, "ready");
 });
 
-test("script_console routes console reads by script id or name", async () => {
+test("script_console is always plain text and stops repeated unchanged polling on the third hash", async () => {
+  let callCount = 0;
   const harness = {
     config: { commandTimeoutMs: 600000, baselineName: "base", replaceBaseline: true },
     async scriptConsole(selector, options) {
+      callCount += 1;
       assert.equal(selector, "overlay");
       assert.deepEqual(options, { startLine: undefined, max: 9, markRead: false, clear: true });
+      const suffix = callCount >= 4 ? "seed=124" : "seed=123";
       return {
         logs: [
           { id: 4, name: "overlay", line: 1, text: "ready" },
-          { id: 4, name: "overlay", line: 2, text: "seed=123" }
+          { id: 4, name: "overlay", line: 2, text: suffix }
         ]
       };
     }
@@ -435,7 +438,7 @@ test("script_console routes console reads by script id or name", async () => {
   assert.equal(reply.result.structuredContent.output, "ready\nseed=123");
   assert.equal(Object.hasOwn(reply.result.structuredContent, "logs"), false);
 
-  const structuredReply = await server.handle({
+  const legacyStructuredArgumentReply = await server.handle({
     jsonrpc: "2.0",
     id: 241,
     method: "tools/call",
@@ -444,8 +447,38 @@ test("script_console routes console reads by script id or name", async () => {
       arguments: { name: "overlay", max: 9, clear: true, structured: true }
     }
   });
-  assert.equal(structuredReply.result.structuredContent.logs[0].text, "ready");
-  assert.equal(structuredReply.result.structuredContent.logs[1].text, "seed=123");
+  assert.equal(legacyStructuredArgumentReply.result.content[0].text, "ready\nseed=123");
+  assert.equal(legacyStructuredArgumentReply.result.structuredContent.output, "ready\nseed=123");
+  assert.equal(Object.hasOwn(legacyStructuredArgumentReply.result.structuredContent, "logs"), false);
+
+  const repeatedReply = await server.handle({
+    jsonrpc: "2.0",
+    id: 242,
+    method: "tools/call",
+    params: {
+      name: "script_console",
+      arguments: { name: "overlay", max: 9, clear: true }
+    }
+  });
+  assert.equal(repeatedReply.result.isError, true);
+  assert.match(repeatedReply.result.content[0].text, /same output hash 3 consecutive times/u);
+
+  const changedReply = await server.handle({
+    jsonrpc: "2.0",
+    id: 243,
+    method: "tools/call",
+    params: {
+      name: "script_console",
+      arguments: { name: "overlay", max: 9, clear: true }
+    }
+  });
+  assert.equal(changedReply.result.content[0].text, "ready\nseed=124");
+  assert.equal(changedReply.result.isError, false);
+});
+
+test("script_console no longer exposes the structured option", () => {
+  const tool = TOOLS.find((candidate) => candidate.name === "script_console");
+  assert.equal(Object.hasOwn(tool.inputSchema.properties, "structured"), false);
 });
 
 test("clear_script_console accepts a name and omitting selectors clears all consoles", async () => {
